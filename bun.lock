@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "cachet",
+      "name": "prompt-cache-optimizer",
       "devDependencies": {
         "@anthropic-ai/sdk": "^0.30.0",
         "@types/node": "^20.11.0",

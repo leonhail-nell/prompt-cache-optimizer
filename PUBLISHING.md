@@ -17,9 +17,22 @@ If you don't already have one:
 1. Go to https://www.npmjs.com/signup
 2. Pick a username, email, and password
 3. Verify your email (npm sends a link — required before you can publish)
-4. **Recommended:** enable 2FA at https://www.npmjs.com/settings/YOUR-USERNAME/profile under "Two-Factor Authentication." npm requires 2FA for "auth-and-writes" mode on new packages, and it's a hard requirement for popular packages.
 
-> Why you have to do this part: account creation and password setup must come from you directly. Same for 2FA setup.
+> Why you have to do this part: account creation and password setup must come from you directly. Same for 2FA setup below.
+
+### Set up 2FA (strongly recommended, ~2 minutes)
+
+npm requires 2FA on most published packages now and it's worth doing before your first publish so you don't have to retrofit it.
+
+1. Install an authenticator app on your phone if you don't have one. Options: Google Authenticator, Authy, 1Password, Bitwarden.
+2. Log in at https://www.npmjs.com, click your avatar → **Account settings**
+3. Find the **Two-Factor Authentication** section, click **Enable 2FA**
+4. Pick **Authorization and publishing** (the stricter mode — you'll be prompted for a code every publish)
+5. Scan the QR code with your authenticator app
+6. Enter the 6-digit code to confirm
+7. **Save your recovery codes somewhere safe** — these are your only way back in if you lose your phone
+
+After this, every `npm publish` will prompt for a 6-digit code from your app.
 
 ## Step 2 — Log in locally (you must do this)
 
@@ -42,7 +55,9 @@ It should print your npm username.
 
 ## Step 3 — Final local check
 
-Run these one more time before publishing:
+Run these one more time before publishing. Use **either** npm or bun, not both (mixing them causes a known rollup native-deps error):
+
+**With npm:**
 
 ```bash
 npm install
@@ -52,15 +67,31 @@ npm run build
 npm pack --dry-run
 ```
 
-All four should succeed. The `pack --dry-run` should list exactly 7 files totaling ~48KB unpacked.
+**With bun:**
 
-> If `npm test` fails with a rollup native-module error, run `rm -rf node_modules package-lock.json && npm install` and try again. That's a known npm bug with optional native deps.
+```bash
+bun install
+bun run typecheck
+bun run test       # IMPORTANT: "bun run test", not "bun test"
+bun run build
+bun pm pack --dry-run
+```
+
+The `pack --dry-run` should list exactly 7 files totaling ~48KB unpacked.
+
+> If you see a rollup native-module error, you have leftover state from the other package manager. Fix: `rm -rf node_modules package-lock.json bun.lock && <your-pm> install`.
+
+> Why `bun run test` and not `bun test`: the latter invokes Bun's built-in test runner, which isn't Vitest. `bun run test` goes through the npm script and calls Vitest properly.
 
 ## Step 4 — Publish
 
 ```bash
 npm publish --access public
+# or:
+bun publish --access public
 ```
+
+Both push to the same npm registry; the output tarball is byte-identical. Bun reads auth from `~/.npmrc` (the same file `npm login` writes to), so you still need to have logged in once via `npm login`.
 
 `--access public` is required because npm defaults scoped packages (`@you/pkg`) to private. For unscoped names like `prompt-cache-optimizer` it's harmless to include explicitly.
 

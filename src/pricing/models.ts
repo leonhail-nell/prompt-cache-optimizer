@@ -5,11 +5,14 @@
  * https://www.anthropic.com/pricing before relying on these in production,
  * or pass `pricingOverride` to the client constructor.
  *
- * Caching multipliers (Anthropic):
+ * Caching multipliers (Anthropic, 5-minute TTL):
  *   - cacheWrite ≈ 1.25× input
  *   - cacheRead  ≈ 0.10× input
  *
- * Last reviewed: May 2026.
+ * Extended 1-hour cache TTL has different pricing — not modeled here.
+ * See https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+ *
+ * Last verified against anthropic.com/pricing: May 13, 2026.
  */
 
 import type { ModelPricing } from "../types.js";
@@ -28,31 +31,32 @@ function withCache(input: number, output: number): ModelPricing {
 /**
  * Known model pricing. Keys are matched as prefixes against the model id
  * passed to messages.create — so "claude-sonnet-4-6-20260101" still maps
- * to the "claude-sonnet-4-6" entry.
+ * to the "claude-sonnet-4-6" entry. Longer prefixes win, so version-specific
+ * entries take precedence over family entries.
  */
 export const KNOWN_MODELS: Record<string, ModelPricing> = {
-  // Claude 4.6 family
-  "claude-opus-4-6": withCache(15, 75),
+  // Active flagship (May 2026)
+  "claude-opus-4-7": withCache(5, 25),
   "claude-sonnet-4-6": withCache(3, 15),
+  "claude-haiku-4-5": withCache(1, 5),
 
-  // Claude 4.5 family
-  "claude-haiku-4-5": withCache(0.8, 4),
-
-  // Claude 4 family (kept for back-compat)
+  // Legacy — still callable, listed on pricing page
+  "claude-opus-4-6": withCache(5, 25),
+  "claude-opus-4-5": withCache(5, 25),
+  "claude-sonnet-4-5": withCache(3, 15),
+  "claude-opus-4-1": withCache(15, 75),
   "claude-opus-4": withCache(15, 75),
   "claude-sonnet-4": withCache(3, 15),
-  "claude-haiku-4": withCache(0.8, 4),
-
-  // Claude 3.x family (legacy)
-  "claude-3-5-sonnet": withCache(3, 15),
-  "claude-3-5-haiku": withCache(0.8, 4),
-  "claude-3-opus": withCache(15, 75),
-  "claude-3-haiku": withCache(0.25, 1.25),
 };
 
 /**
  * Look up pricing for a model id. Returns undefined if the model is unknown
  * — caller can surface a warning and skip dollar accounting for that call.
+ *
+ * Resolution order:
+ *   1. Exact match in overrides
+ *   2. Longest prefix match in KNOWN_MODELS
+ *   3. Longest prefix match in overrides
  */
 export function lookupPricing(
   modelId: string,
