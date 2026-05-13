@@ -1,6 +1,6 @@
 {
   "name": "prompt-cache-optimizer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop-in wrapper for the Anthropic SDK that places cache_control breakpoints, measures cache hit rate, and warns when your prompt caching silently breaks.",
   "type": "module",
   "main": "./dist/index.cjs",
