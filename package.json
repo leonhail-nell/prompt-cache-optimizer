@@ -37,7 +37,16 @@
     "cost-optimization",
     "tokens"
   ],
+  "author": "Leonhail Paypa",
   "license": "MIT",
+  "homepage": "https://github.com/leonhail-nell/prompt-cache-optimizer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leonhail-nell/prompt-cache-optimizer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/leonhail-nell/prompt-cache-optimizer/issues"
+  },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.27.0"
   },

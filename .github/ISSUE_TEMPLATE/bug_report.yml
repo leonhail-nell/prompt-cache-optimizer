@@ -1,0 +1,59 @@
+name: Bug report
+description: Something's not working as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in what you can.
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `npm ls prompt-cache-optimizer` (or `bun pm ls prompt-cache-optimizer`)
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: Output of `node --version`
+      placeholder: v20.11.0
+    validations:
+      required: true
+
+  - type: input
+    id: sdk
+    attributes:
+      label: "@anthropic-ai/sdk version"
+      placeholder: ^0.30.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect vs. what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        Smallest code snippet that reproduces the bug. Please redact your API key.
+      render: ts
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant warnings or errors
+      description: Anything emitted to console or via `onWarning`
+      render: shell

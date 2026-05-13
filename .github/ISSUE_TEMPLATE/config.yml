@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Anthropic prompt caching docs
+    url: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+    about: For questions about how Anthropic prompt caching itself works, please read the official docs first.
+  - name: Anthropic SDK issues
+    url: https://github.com/anthropics/anthropic-sdk-typescript/issues
+    about: If the issue is with the underlying Anthropic SDK rather than this wrapper, file it there.
