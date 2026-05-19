@@ -8,6 +8,10 @@
 
 Drop-in wrapper for the Anthropic SDK that makes prompt caching effortless. Places `cache_control` breakpoints, measures real cache hit rate from the response usage object, and warns when your cache silently breaks.
 
+![Real output: 5 calls, 80% hit rate, $0.017 saved on $0.020 spent — a 46% reduction vs. running without caching.](assets/stats-screenshot.png)
+
+> Real output from `bun run example` — 5 calls, 80% hit rate, $0.017 saved on $0.020 spent. Same workload without caching would have cost $0.037 (~46% more).
+
 > Status: v0.1 — measurement and explicit helpers. Auto-placement lands in v0.2.
 
 ## Why this exists
@@ -136,3 +140,7 @@ If this package saved you money on your Anthropic bill, consider buying me a cof
 ## License
 
 [MIT](LICENSE) © Leonhail Paypa
+
+---
+
+⭐ **If this package saved you money on your Anthropic bill, please star the repo.** It's the single biggest signal that helps other developers find it.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Added real screenshot of `client.stats()` output to the README (5 calls, 80% hit rate, 46% cost reduction)
+- Added "Star this repo" call-to-action at the bottom of the README
+
 ## 0.1.2
 
 - Added `funding` field to `package.json` so the npm package page shows a Sponsor link
