@@ -125,6 +125,14 @@ new CachedAnthropic({
 
 PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Support this project
+
+If this package saved you money on your Anthropic bill, consider buying me a coffee. This project is MIT-licensed and free forever; sponsorship just helps me spend more time on it.
+
+<a href="https://buymeacoffee.com/leonhail" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/leonhail-nell)
+
 ## License
 
 [MIT](LICENSE) © Leonhail Paypa

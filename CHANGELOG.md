@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2
+
+- Added `funding` field to `package.json` so the npm package page shows a Sponsor link
+- Added "Support this project" section to the README with Buy Me a Coffee button
+- Added `.github/FUNDING.yml` for the GitHub "Sponsor" button
+- Updated pricing table against live anthropic.com/pricing (Opus 4.7, corrected Opus 4.6 and Haiku 4.5 rates)
+- Added repository, bugs, and homepage metadata to `package.json`
+- Added GitHub Actions CI (typecheck + tests + build on Node 18/20/22 via bun)
+- Added issue templates (bug report, feature request)
+- Added CONTRIBUTING.md
+
+## 0.1.1
+
+- README updated to use the correct package name (`prompt-cache-optimizer`, previously referenced an old name)
+
 ## 0.1.0 — MVP
 
 Initial release.
