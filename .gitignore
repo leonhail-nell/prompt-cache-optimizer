@@ -7,3 +7,7 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
+
+# Personal launch / publish notes — kept local
+LAUNCH.md
+PUBLISHING.md
