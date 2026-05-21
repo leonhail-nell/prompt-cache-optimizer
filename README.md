@@ -6,13 +6,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](tsconfig.json)
 
-Drop-in wrapper for the Anthropic SDK that makes prompt caching effortless. Places `cache_control` breakpoints, measures real cache hit rate from the response usage object, and warns when your cache silently breaks.
+Drop-in wrapper for the Anthropic SDK that makes prompt caching effortless. Auto-places `cache_control` breakpoints based on observed prompt stability, measures real cache hit rate from the response usage object, and explains exactly what changed when your cache silently breaks.
 
 ![Real output: 5 calls, 80% hit rate, $0.017 saved on $0.020 spent — a 46% reduction vs. running without caching.](assets/stats-screenshot.png)
 
 > Real output from `bun run example` — 5 calls, 80% hit rate, $0.017 saved on $0.020 spent. Same workload without caching would have cost $0.037 (~46% more).
 
-> Status: v0.1 — measurement and explicit helpers. Auto-placement lands in v0.2.
+> Status: v0.2 — auto-placement + cache-miss diagnostics + per-segment stability report. Backwards compatible with v0.1.
 
 ## Why this exists
 
@@ -34,16 +34,19 @@ npm install prompt-cache-optimizer @anthropic-ai/sdk
 bun add prompt-cache-optimizer @anthropic-ai/sdk
 ```
 
-## Quick start
+## Quick start (v0.2 — auto-placement)
 
 ```ts
 import { CachedAnthropic } from "prompt-cache-optimizer";
 
 const client = new CachedAnthropic({
   apiKey: process.env.ANTHROPIC_API_KEY!,
+  autoCache: true,           // ← let the wrapper place cache_control for you
+  diagnoseMisses: true,      // ← explain what changed when the cache misses
   warnIfHitRateBelow: 0.6,
 });
 
+// Use the SDK exactly like normal. No placeBreakpoints() needed.
 const response = await client.messages.create({
   model: "claude-sonnet-4-6",
   max_tokens: 1024,
@@ -56,11 +59,27 @@ console.log(response.cacheInfo);
 
 console.log(client.stats());
 // { totalCalls: 1, hitRate: 1, totalCachedTokens: 8420, dollarsSaved: 0.024, ... }
+
+console.log(client.stability());
+// { entries: [{ segment: 'system', stabilityScore: 1, approxTokens: 2103, ... }], ... }
 ```
 
-## Manual breakpoint placement
+The first call always misses (that's when the cache is written). Once the wrapper has seen the system prompt twice unchanged, it auto-marks it cacheable and subsequent calls hit. No code changes needed when your prompt shape evolves — auto-placement re-evaluates each call.
 
-For v0.1, breakpoint placement is opt-in via the `placeBreakpoints` helper:
+## How auto-placement decides what to cache
+
+On every call the wrapper:
+
+1. Fingerprints each candidate segment — `system`, `tools`, and every cumulative `messages[0..N]` prefix — using SHA-256 over a canonical form (cache_control markers stripped so they don't affect the hash).
+2. Tracks the fingerprint history per segment.
+3. Once a segment has been seen unchanged for at least `autoCacheMinObservations` consecutive calls (default `2`), it qualifies for auto-placement.
+4. Picks the highest-value placements within Anthropic's 4-breakpoint budget: system first, then tools, then the longest stable message prefix.
+
+You can inspect this state live with `client.stability()`.
+
+## Manual breakpoint placement (still supported)
+
+If you want explicit control, `placeBreakpoints` from v0.1 still works exactly as before. Auto-placement is a no-op whenever you've already marked anything cacheable yourself — your intent is always respected.
 
 ```ts
 import { placeBreakpoints } from "prompt-cache-optimizer";
@@ -96,14 +115,41 @@ client.stats();
 // }
 ```
 
+## Cache-miss diagnostics
+
+Enable `diagnoseMisses: true` and every `cache-write-without-read` warning gets a structured diff explaining what changed. Example:
+
+```ts
+new CachedAnthropic({
+  apiKey,
+  diagnoseMisses: true,
+  onWarning: (event) => {
+    if (event.code === "cache-write-without-read") {
+      console.error(event.message);
+      // → "...Detected: system prompt changed at character 1240: ...the docs as of [Tuesday|Wednesday]..."
+      console.error(event.detail?.diff);
+      // → [{ segment: 'system', summary: '...', detail: { changeIndex: 1240, ... } }]
+    }
+  },
+});
+```
+
+Common things it catches:
+
+- system prompt drift (inserted timestamps, dynamic context)
+- tool order changes
+- retrieved-document reordering
+- TTL expiration (cache was fine, then nobody called within 5 minutes)
+
 ## Warnings
 
 The client emits passive warnings (never throws, never blocks a request):
 
-- `no-cache-control-found` — you forgot to mark anything cacheable
-- `cache-write-without-read` — your prefix changed call-over-call; cache is broken
+- `no-cache-control-found` — you forgot to mark anything cacheable AND auto-cache hasn't activated yet
+- `cache-write-without-read` — your prefix changed call-over-call; cache is broken (carries a diff when `diagnoseMisses: true`)
 - `low-hit-rate` — rolling hit rate fell below your threshold
 - `unknown-model` — pricing unknown, so dollar accounting is skipped
+- `auto-placement-applied` — info-level: the wrapper just placed cache_control on a newly-stable segment
 
 Route them anywhere:
 
@@ -116,14 +162,14 @@ new CachedAnthropic({
 
 ## Roadmap
 
-- **v0.2** — auto-placement of `cache_control` breakpoints based on observed prompt stability
+- ~~**v0.2** — auto-placement of `cache_control` breakpoints based on observed prompt stability~~ ✅ shipped
 - **v0.3** — safe message and tool reordering to maximize the stable prefix
 - **v0.4** — OpenAI and Gemini prompt caching support
 - **v1.0** — persistent stats adapter, middleware mode
 
 ## Zero runtime dependencies
 
-`@anthropic-ai/sdk` is a peer dependency. `prompt-cache-optimizer` itself has zero runtime deps. The unpacked install is under 50 KB.
+`@anthropic-ai/sdk` is a peer dependency. `prompt-cache-optimizer` itself has zero runtime deps. v0.2 uses Node's built-in `node:crypto` for fingerprinting.
 
 ## Contributing
 

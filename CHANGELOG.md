@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0
+
+Headline features — all opt-in, all backwards compatible with v0.1.
+
+- **Auto-placement**: pass `autoCache: true` and the wrapper observes which segments of your request (system, tools, message history) are stable across calls and places `cache_control` markers automatically. No more `placeBreakpoints()` boilerplate. Activates only when you have not placed any markers yourself — explicit intent is always respected.
+- **Cache-miss diagnostic**: pass `diagnoseMisses: true` and every `cache-write-without-read` warning gets a human-readable diff explaining what changed (`"system prompt changed at character 1240: ...[Tuesday|Wednesday]..."`, `"tool order changed at indices [2, 4]"`, etc.).
+- **`client.stability()`**: per-segment stability report so you can debug which part of your prompt is drifting before it costs you money.
+- New `autoCacheMinObservations` option (default 2) — how many times a segment must be seen unchanged before auto-placement marks it cacheable.
+- New `auto-placement-applied` info-level warning event so you can see what the wrapper did.
+- New public helpers exported: `autoPlaceBreakpoints`, `StabilityTracker`, `snapshotRequest`, `fingerprint`, `approxTokenCount`, `diffSnapshots`.
+- New public types: `PrefixDiff`, `StabilityEntry`, `StabilityReport`, `RequestSnapshot`.
+- Zero new runtime dependencies (still just `@anthropic-ai/sdk` as peer dep; fingerprinting uses Node's built-in `node:crypto`).
+
 ## 0.1.3
 
 - Added real screenshot of `client.stats()` output to the README (5 calls, 80% hit rate, 46% cost reduction)
@@ -34,7 +47,6 @@ Initial release.
 
 ## Unreleased / planned
 
-- v0.2: auto-placement, cache-miss diagnostic with prefix diff
-- v0.3: safe message/tool reordering
-- v0.4: OpenAI + Gemini support
-- v1.0: persistent stats adapter, middleware mode
+- v0.3: safe message/tool reordering (so a slightly shuffled tool array still hits cache)
+- v0.4: OpenAI + Gemini prompt-caching support
+- v1.0: persistent stats adapter (write hit-rate to disk / Redis), middleware mode for Express/Fastify

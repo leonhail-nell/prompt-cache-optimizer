@@ -57,10 +57,50 @@ export interface WarningEvent {
     | "low-hit-rate"
     | "unknown-model"
     | "no-cache-control-found"
-    | "cache-write-without-read";
+    | "cache-write-without-read"
+    /** Info-level: v0.2 auto-placement applied a breakpoint we previously hadn't. */
+    | "auto-placement-applied";
   message: string;
   /** Optional structured detail. */
   detail?: Record<string, unknown>;
+}
+
+/**
+ * A human-readable summary of what changed in a cacheable prefix between two
+ * calls. Surfaced via the `cache-write-without-read` warning when
+ * `diagnoseMisses` is enabled.
+ */
+export interface PrefixDiff {
+  /** Which segment changed: 'system', 'tools', or 'messages'. */
+  segment: "system" | "tools" | "messages";
+  /** Short, single-line explanation suitable for logging. */
+  summary: string;
+  /** Optional structured detail (indices, byte offsets, token counts). */
+  detail?: Record<string, unknown>;
+}
+
+/** Per-segment stability tracking, returned by client.stability(). */
+export interface StabilityEntry {
+  /** Which segment: 'system', 'tools', or 'messages[0..N]'. */
+  segment: string;
+  /** Number of times this segment was observed across calls. */
+  callsObserved: number;
+  /** Number of those calls where the fingerprint matched the previous one. */
+  callsStable: number;
+  /** callsStable / max(1, callsObserved - 1). 1.0 = perfectly stable. */
+  stabilityScore: number;
+  /** Approximate token count for this segment (chars/4 heuristic). */
+  approxTokens: number;
+  /** Reason the most recent change happened, if known. */
+  lastChangeReason?: string;
+}
+
+export interface StabilityReport {
+  entries: StabilityEntry[];
+  /** Total approximate tokens across all stable segments. */
+  totalStableTokens: number;
+  /** Total approximate tokens across all observed segments. */
+  totalObservedTokens: number;
 }
 
 /** Options for constructing a CachedAnthropic client. */
@@ -82,6 +122,26 @@ export interface CachedAnthropicOptions {
   onWarning?: (event: WarningEvent) => void;
   /** Pass through any additional options to the underlying Anthropic SDK. */
   anthropicClientOptions?: Record<string, unknown>;
+  /**
+   * v0.2: when true, the wrapper observes which segments of your request
+   * (system, tools, message history) are stable across calls and places
+   * `cache_control` breakpoints automatically. Activates only when you have
+   * not placed any cache_control markers yourself — never overrides explicit
+   * placement. Default: false (opt-in).
+   */
+  autoCache?: boolean;
+  /**
+   * v0.2: how many times a segment must be seen unchanged before
+   * auto-placement will mark it cacheable. Default: 2 (i.e. seen at least
+   * twice in a row identically). Higher values are more conservative.
+   */
+  autoCacheMinObservations?: number;
+  /**
+   * v0.2: when true, the wrapper computes a human-readable prefix diff on
+   * every cache-write-without-read event and attaches it to the warning
+   * detail. Adds a small per-call CPU cost. Default: false (opt-in).
+   */
+  diagnoseMisses?: boolean;
 }
 
 /** Per-million-token pricing in USD. */

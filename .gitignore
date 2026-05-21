@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-v2/
 coverage/
 .env
 .env.local
@@ -11,3 +12,5 @@ coverage/
 # Personal launch / publish notes — kept local
 LAUNCH.md
 PUBLISHING.md
+BLOG-POST.md
+BLOG-POST-*.md

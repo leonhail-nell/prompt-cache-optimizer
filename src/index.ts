@@ -1,14 +1,17 @@
 /**
- * Public surface for cachet v0.1.
+ * Public surface for prompt-cache-optimizer.
  *
- * Stable in v0.1:
- *   - CachedAnthropic class
+ * Stable since v0.1:
+ *   - CachedAnthropic class (now with autoCache + diagnoseMisses + stability())
  *   - placeBreakpoints() helper
  *   - All public types
  *
- * Marked unstable for v0.1 (signature may change in v0.2):
- *   - hasAnyCacheControl
- *   - StatsAggregator (exposed for advanced users)
+ * Added in v0.2:
+ *   - autoPlaceBreakpoints (functional auto-placement)
+ *   - StabilityTracker (advanced, exposed for non-client integrations)
+ *   - diffSnapshots (diagnostic, exposed for advanced users)
+ *   - snapshotRequest / fingerprint / approxTokenCount utilities
+ *   - PrefixDiff, StabilityReport, StabilityEntry types
  */
 
 export { CachedAnthropic } from "./client.js";
@@ -24,6 +27,23 @@ export type {
   PlaceBreakpointsOutput,
 } from "./analyzer/breakpoint-placer.js";
 
+export { autoPlaceBreakpoints } from "./analyzer/auto-placer.js";
+export type {
+  AutoPlaceInput,
+  AutoPlaceOutput,
+} from "./analyzer/auto-placer.js";
+
+export { StabilityTracker } from "./analyzer/stability-tracker.js";
+
+export {
+  fingerprint,
+  approxTokenCount,
+  snapshotRequest,
+} from "./analyzer/fingerprint.js";
+export type { RequestSnapshot } from "./analyzer/fingerprint.js";
+
+export { diffSnapshots } from "./diagnostics/diff.js";
+
 export { computeCacheInfo } from "./tracking/hit-rate.js";
 export { StatsAggregator } from "./tracking/stats.js";
 
@@ -36,5 +56,8 @@ export type {
   CachedAnthropicOptions,
   ModelId,
   ModelPricing,
+  PrefixDiff,
+  StabilityEntry,
+  StabilityReport,
   WarningEvent,
 } from "./types.js";
