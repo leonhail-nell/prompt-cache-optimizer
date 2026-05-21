@@ -51,6 +51,32 @@ describe("StabilityTracker", () => {
     expect(system.stabilityScore).toBe(1);
   });
 
+  it("cumulative stabilityScore does not collapse to 0 after a single late change", () => {
+    const tracker = new StabilityTracker();
+    const stable = {
+      system: "stable system prompt",
+      messages: [{ role: "user" as const, content: "hi" }],
+    };
+    // Five identical observations
+    for (let i = 0; i < 5; i++) tracker.observe(snapshotRequest(stable));
+    // One drift
+    tracker.observe(
+      snapshotRequest({
+        system: "stable system prompt CHANGED",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    const sys = tracker
+      .report()
+      .entries.find((e) => e.segment === "system")!;
+    expect(sys.callsObserved).toBe(6);
+    expect(sys.stabilityScore).toBeGreaterThan(0.5);
+    // Auto-placer should NOT consider it stable right now though
+    expect(tracker.stableSegments(2).some((s) => s.segment === "system")).toBe(
+      false,
+    );
+  });
+
   it("reset() wipes state", () => {
     const tracker = new StabilityTracker();
     tracker.observe(

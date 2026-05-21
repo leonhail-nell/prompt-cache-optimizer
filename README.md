@@ -8,9 +8,9 @@
 
 Drop-in wrapper for the Anthropic SDK that makes prompt caching effortless. Auto-places `cache_control` breakpoints based on observed prompt stability, measures real cache hit rate from the response usage object, and explains exactly what changed when your cache silently breaks.
 
-![Real output: 5 calls, 80% hit rate, $0.017 saved on $0.020 spent — a 46% reduction vs. running without caching.](assets/stats-screenshot.png)
+![Real output: autoCache marks the system prompt cacheable after observing it twice, the next 3 calls hit the cache (~1569 cached tokens each, $0.0042 saved per call), and a deliberate drift triggers the cache-miss diagnostic showing the exact characters that changed.](assets/stats-screenshot.png)
 
-> Real output from `bun run example` — 5 calls, 80% hit rate, $0.017 saved on $0.020 spent. Same workload without caching would have cost $0.037 (~46% more).
+> Real output from `bun run example`. Six calls — autoCache marks the system prompt cacheable after observing it twice, calls 3–5 hit the cache (~1569 cached tokens each), and a final deliberate drift triggers the diagnostic showing the exact characters that changed. `client.stability()` reports `system score=0.80` cumulative across the run.
 
 > Status: v0.2 — auto-placement + cache-miss diagnostics + per-segment stability report. Backwards compatible with v0.1.
 

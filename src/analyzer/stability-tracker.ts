@@ -17,7 +17,18 @@ interface TrackedSegment {
   lastFingerprint: string;
   lastApproxTokens: number;
   callsObserved: number;
-  callsStable: number;
+  /**
+   * Cumulative count of times the fingerprint matched the prior observation.
+   * Never decreases — used to compute the report's `stabilityScore` so a
+   * single late change doesn't wipe out a long history of stability.
+   */
+  totalStable: number;
+  /**
+   * Length of the current streak of unchanged observations. Resets to 0 on
+   * any change. Used by the auto-placer to decide whether a segment is
+   * cacheable RIGHT NOW.
+   */
+  consecutiveStable: number;
   lastChangeReason?: string;
 }
 
@@ -52,17 +63,20 @@ export class StabilityTracker {
     let totalObserved = 0;
     for (const seg of this.segments.values()) {
       const denom = Math.max(1, seg.callsObserved - 1);
-      const score = seg.callsStable / denom;
+      // Score is cumulative — a stretch of stability isn't erased by one
+      // late change. Use consecutiveStable to know "is it stable RIGHT NOW".
+      const score = seg.totalStable / denom;
       entries.push({
         segment: seg.segment,
         callsObserved: seg.callsObserved,
-        callsStable: seg.callsStable,
+        callsStable: seg.totalStable,
         stabilityScore: score,
         approxTokens: seg.lastApproxTokens,
         lastChangeReason: seg.lastChangeReason,
       });
       totalObserved += seg.lastApproxTokens;
-      if (score === 1 && seg.callsObserved > 1) {
+      // "Currently stable" = at least 1 consecutive identical observation
+      if (seg.consecutiveStable >= 1) {
         totalStable += seg.lastApproxTokens;
       }
     }
@@ -75,17 +89,15 @@ export class StabilityTracker {
 
   /**
    * Return the list of segments that have been stable for at least
-   * `minObservations` calls. Sorted descending by approxTokens so the
-   * auto-placer can pick the biggest wins first.
+   * `minObservations` calls IN A ROW (consecutive). Sorted descending by
+   * approxTokens so the auto-placer can pick the biggest wins first.
    */
   stableSegments(minObservations: number): TrackedSegment[] {
     const stable: TrackedSegment[] = [];
     for (const seg of this.segments.values()) {
-      // "Stable" = has been observed at least `minObservations` times AND
-      // the most recent run was unchanged from the prior one.
       if (
         seg.callsObserved >= minObservations &&
-        seg.callsStable >= minObservations - 1
+        seg.consecutiveStable >= minObservations - 1
       ) {
         stable.push(seg);
       }
@@ -113,18 +125,21 @@ export class StabilityTracker {
         lastFingerprint: fingerprint,
         lastApproxTokens: approxTokens,
         callsObserved: 1,
-        callsStable: 0,
+        totalStable: 0,
+        consecutiveStable: 0,
       });
       return;
     }
     prev.callsObserved += 1;
     prev.lastApproxTokens = approxTokens;
     if (prev.lastFingerprint === fingerprint) {
-      prev.callsStable += 1;
+      prev.totalStable += 1;
+      prev.consecutiveStable += 1;
     } else {
       prev.lastFingerprint = fingerprint;
-      // Stability is "consecutive identical runs", so a change resets it.
-      prev.callsStable = 0;
+      // Only the "is it stable right now" counter resets; the cumulative
+      // total stays so the report doesn't lie about long histories.
+      prev.consecutiveStable = 0;
       if (changeReason !== undefined) {
         prev.lastChangeReason = changeReason;
       }

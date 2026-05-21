@@ -57,6 +57,12 @@ export class CachedAnthropic {
   private readonly tracker: StabilityTracker;
   private readonly opts: CachedAnthropicOptions;
   private warnedAboutNoCacheControl = false;
+  /**
+   * Signature of the last placement set we emitted an auto-placement-applied
+   * event for. We only re-emit when this CHANGES so the warning isn't
+   * triggered on every call once a steady-state placement is reached.
+   */
+  private lastAnnouncedPlacements: string | undefined;
 
   constructor(opts: CachedAnthropicOptions = {}) {
     this.opts = opts;
@@ -87,6 +93,7 @@ export class CachedAnthropic {
     this.stats_.reset();
     this.tracker.reset();
     this.warnedAboutNoCacheControl = false;
+    this.lastAnnouncedPlacements = undefined;
   }
 
   /**
@@ -146,11 +153,23 @@ export class CachedAnthropic {
               : {}),
             messages: placed.messages as unknown as Anthropic.MessageCreateParamsNonStreaming["messages"],
           };
-          safeEmit(this.opts.onWarning, {
-            code: "auto-placement-applied",
-            message: `Auto-placement added ${placed.placements.length} cache_control breakpoint(s) based on observed stability.`,
-            detail: { placements: placed.placements },
-          });
+          // Only announce when the SET of placements changes — once we hit a
+          // steady-state ("system is cached"), repeating that on every call
+          // is noise.
+          const signature = placed.placements
+            .map((p) => p.position)
+            .sort()
+            .join(",");
+          if (signature !== this.lastAnnouncedPlacements) {
+            this.lastAnnouncedPlacements = signature;
+            safeEmit(this.opts.onWarning, {
+              code: "auto-placement-applied",
+              message: `Auto-placement set: ${placed.placements
+                .map((p) => p.position)
+                .join(", ")} (based on observed stability).`,
+              detail: { placements: placed.placements },
+            });
+          }
         }
       }
 
@@ -172,7 +191,14 @@ export class CachedAnthropic {
             | undefined,
         });
 
-      if (!this.warnedAboutNoCacheControl && !finalHasCache) {
+      // Suppress this warning when autoCache is on — the user opted into the
+      // auto path, and the wrapper just needs more observations before it
+      // can place anything. Firing this warning in that mode is contradictory.
+      if (
+        !this.warnedAboutNoCacheControl &&
+        !finalHasCache &&
+        !this.opts.autoCache
+      ) {
         this.warnedAboutNoCacheControl = true;
         safeEmit(this.opts.onWarning, {
           code: "no-cache-control-found",
@@ -199,11 +225,18 @@ export class CachedAnthropic {
       const usage = response.usage as AnthropicUsage;
       const cacheInfo = computeCacheInfo(usage, pricing);
 
-      // Cache write but no read suggests prefix changed call-over-call
+      // Cache write but no read suggests prefix changed call-over-call.
+      // Only fire when we've already had cache activity on a PRIOR call —
+      // otherwise the very first cache write trips a misleading "prefix
+      // changed" warning when in fact the cache was just initialized.
+      const priorStats = this.stats_.snapshot();
+      const hadPriorCacheActivity =
+        priorStats.totalCachedTokens > 0 ||
+        priorStats.totalCacheWriteTokens > 0;
       if (
         cacheInfo.cacheWriteTokens > 0 &&
         cacheInfo.cachedTokens === 0 &&
-        this.stats_.snapshot().totalCalls > 0
+        hadPriorCacheActivity
       ) {
         const detail: Record<string, unknown> = {};
         if (this.opts.diagnoseMisses && previousSnapshot) {

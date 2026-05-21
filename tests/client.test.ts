@@ -242,6 +242,72 @@ describe("CachedAnthropic v0.2 — autoCache", () => {
   });
 });
 
+describe("CachedAnthropic v0.2 — warning gating", () => {
+  it("does not emit no-cache-control-found when autoCache is on", async () => {
+    const { client, warnings } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoCache: true },
+    );
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      system: "sys",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(warnings.some((w) => w.code === "no-cache-control-found")).toBe(
+      false,
+    );
+  });
+
+  it("emits auto-placement-applied only when the placement set changes", async () => {
+    const { client, warnings } = withProgrammableStub(
+      Array.from({ length: 5 }, () => ({ input_tokens: 10, output_tokens: 5 })),
+      { autoCache: true, autoCacheMinObservations: 2 },
+    );
+    const base = {
+      model: "claude-sonnet-4-6" as const,
+      max_tokens: 100,
+      system: "the same system across calls",
+      messages: [{ role: "user" as const, content: "q" }],
+    };
+    for (let i = 0; i < 5; i++) {
+      await client.messages.create({
+        ...base,
+        messages: [{ role: "user", content: `q${i}` }],
+      });
+    }
+    const applied = warnings.filter((w) => w.code === "auto-placement-applied");
+    // Should fire exactly once when system becomes cacheable, not on every
+    // subsequent call.
+    expect(applied).toHaveLength(1);
+  });
+
+  it("does not emit cache-write-without-read on the very first cache write", async () => {
+    const { client, warnings } = withProgrammableStub(
+      [
+        {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_creation_input_tokens: 500,
+          cache_read_input_tokens: 0,
+        },
+      ],
+      { diagnoseMisses: true },
+    );
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      system: [
+        { type: "text", text: "sys", cache_control: { type: "ephemeral" } },
+      ],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(warnings.some((w) => w.code === "cache-write-without-read")).toBe(
+      false,
+    );
+  });
+});
+
 describe("CachedAnthropic v0.2 — diagnoseMisses", () => {
   it("attaches a prefix diff when the cache misses on the second call", async () => {
     const { client, warnings } = withProgrammableStub(

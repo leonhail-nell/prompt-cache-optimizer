@@ -4,13 +4,21 @@
  *
  * This example simulates a chatbot that re-uses a large system prompt across
  * 5 turns. Without prompt caching, you'd pay the full input-token cost for
- * the system prompt every turn. With cachet, you pay it once and read from
- * cache on turns 2–5.
+ * the system prompt every turn. With prompt-cache-optimizer v0.2 you set
+ * `autoCache: true` and the wrapper handles cache_control placement for you:
+ *
+ *   - Call 1: nothing cached yet → full price (also a cache write)
+ *   - Call 2: system prompt seen unchanged → wrapper marks it cacheable
+ *   - Calls 3–5: cache hits, you pay ~10% of input price for the cached portion
+ *
+ * After the main loop the example deliberately modifies the system prompt by
+ * one character to demonstrate the v0.2 cache-miss diagnostic — the warning
+ * will tell you exactly which character changed and roughly where.
  */
 
 import { CachedAnthropic, placeBreakpoints } from "../src/index.js";
 
-const longSystemPrompt = `
+const longSystemPromptBase = `
 You are a senior support engineer for the fictional product Foobar v3.
 Below is the full Foobar v3 user manual, organized by feature area. When
 answering, cite specific section numbers.
@@ -21,6 +29,10 @@ ${"\n## Section about Foobar features\nFoobar does many useful things.".repeat(8
 async function main() {
   const client = new CachedAnthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
+    // v0.2: let the wrapper place cache_control breakpoints for you.
+    autoCache: true,
+    // v0.2: explain WHY when caching breaks (instead of just "the prefix changed").
+    diagnoseMisses: true,
     warnIfHitRateBelow: 0.5,
     onWarning: (w) => console.log(`⚠️  ${w.code}: ${w.message}`),
   });
@@ -34,17 +46,13 @@ async function main() {
   ];
 
   for (const question of questions) {
-    const { system, messages } = placeBreakpoints({
-      system: longSystemPrompt,
-      messages: [{ role: "user", content: question }],
-      strategy: "after-system",
-    });
-
+    // No placeBreakpoints() needed — autoCache handles it once the system
+    // prompt has been seen twice.
     const res = await client.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 256,
-      system,
-      messages,
+      system: longSystemPromptBase,
+      messages: [{ role: "user", content: question }],
     });
 
     const firstBlock = res.content[0];
@@ -59,7 +67,39 @@ async function main() {
     );
   }
 
-  console.log("\n=== Final stats ===");
+  // v0.2 demo: force a cache-miss to show what the diagnostic looks like.
+  // We deliberately bypass auto-placement here by calling placeBreakpoints
+  // ourselves with a DRIFTED system prompt. The cache for the V1 prompt is
+  // still warm from the loop above, so this call writes the V2 prompt
+  // without reading anything — exactly the silent-failure mode the
+  // diagnostic was built to surface.
+  console.log("\n=== Demo: triggering a cache-miss diagnostic ===");
+  const driftedSystemPrompt = longSystemPromptBase.replace(
+    "senior support engineer",
+    "principal support engineer",
+  );
+  const drifted = placeBreakpoints({
+    system: driftedSystemPrompt,
+    messages: [{ role: "user", content: "Quick smoke test, hello." }],
+    strategy: "after-system",
+  });
+  await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    system: drifted.system,
+    messages: drifted.messages,
+  });
+
+  console.log("\n=== Per-segment stability (client.stability()) ===");
+  const stability = client.stability();
+  for (const entry of stability.entries) {
+    console.log(
+      `  ${entry.segment.padEnd(20)} score=${entry.stabilityScore.toFixed(2)} ` +
+        `observed=${entry.callsObserved} approxTokens=${entry.approxTokens}`,
+    );
+  }
+
+  console.log("\n=== Final aggregate stats (client.stats()) ===");
   console.log(client.stats());
 }
 
