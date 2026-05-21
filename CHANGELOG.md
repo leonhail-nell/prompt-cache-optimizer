@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Refreshed the README screenshot and caption to show the actual v0.2 output (auto-placement, cache-miss diagnostic with prefix diff, and per-segment stability score). No code changes.
+
 ## 0.2.0
 
 Headline features — all opt-in, all backwards compatible with v0.1.
