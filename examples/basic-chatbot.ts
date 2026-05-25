@@ -14,6 +14,13 @@
  * After the main loop the example deliberately modifies the system prompt by
  * one character to demonstrate the v0.2 cache-miss diagnostic — the warning
  * will tell you exactly which character changed and roughly where.
+ *
+ * The example ALSO passes the same set of tool definitions in a different
+ * order on each turn to demonstrate v0.3's `autoReorder`. Without
+ * autoReorder, every shuffled tools array silently breaks the cache prefix.
+ * With it on, the wrapper alphabetizes the tools before sending — so the
+ * tools-portion of the cache still matches across calls. Look for the
+ * `auto-reorder-applied` warning in the output.
  */
 
 import { CachedAnthropic, placeBreakpoints } from "../src/index.js";
@@ -33,6 +40,9 @@ async function main() {
     autoCache: true,
     // v0.2: explain WHY when caching breaks (instead of just "the prefix changed").
     diagnoseMisses: true,
+    // v0.3: canonicalize order-insensitive parts of the request so a
+    // shuffled tools array (or RAG document set) still hits the cache.
+    autoReorder: true,
     warnIfHitRateBelow: 0.5,
     onWarning: (w) => console.log(`⚠️  ${w.code}: ${w.message}`),
   });
@@ -45,13 +55,54 @@ async function main() {
     "How do I cancel my subscription?",
   ];
 
-  for (const question of questions) {
+  // Three tool definitions we'll shuffle each turn. The model never calls
+  // them — they're there to demonstrate the v0.3 reorder behavior without
+  // requiring tool_use round-trips.
+  const tools = [
+    {
+      name: "search_kb",
+      description: "Search the Foobar knowledge base for an article.",
+      input_schema: {
+        type: "object" as const,
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+    },
+    {
+      name: "lookup_account",
+      description: "Look up the user's account by ID.",
+      input_schema: {
+        type: "object" as const,
+        properties: { id: { type: "string" } },
+        required: ["id"],
+      },
+    },
+    {
+      name: "open_ticket",
+      description: "Create a support ticket on the user's behalf.",
+      input_schema: {
+        type: "object" as const,
+        properties: { subject: { type: "string" } },
+        required: ["subject"],
+      },
+    },
+  ];
+
+  // Simple deterministic shuffle: rotate by `i` so each call sends a
+  // different order. autoReorder canonicalizes it back to alphabetical
+  // before the request goes out.
+  const rotate = <T>(arr: T[], n: number): T[] =>
+    arr.slice(n % arr.length).concat(arr.slice(0, n % arr.length));
+
+  for (let i = 0; i < questions.length; i++) {
+    const question = questions[i]!;
     // No placeBreakpoints() needed — autoCache handles it once the system
     // prompt has been seen twice.
     const res = await client.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 256,
       system: longSystemPromptBase,
+      tools: rotate(tools, i),
       messages: [{ role: "user", content: question }],
     });
 

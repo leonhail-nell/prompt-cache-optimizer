@@ -12,6 +12,11 @@
  *   - diffSnapshots (diagnostic, exposed for advanced users)
  *   - snapshotRequest / fingerprint / approxTokenCount utilities
  *   - PrefixDiff, StabilityReport, StabilityEntry types
+ *
+ * Added in v0.3:
+ *   - applyAutoReorder (functional canonicalization)
+ *   - canonicalizeTools / canonicalizeMessageContent / canonicalizeMessagePrefix
+ *   - ReorderDiagnostic type
  */
 
 export { CachedAnthropic } from "./client.js";
@@ -32,6 +37,17 @@ export type {
   AutoPlaceInput,
   AutoPlaceOutput,
 } from "./analyzer/auto-placer.js";
+
+export {
+  applyAutoReorder,
+  canonicalizeTools,
+  canonicalizeMessageContent,
+  canonicalizeMessagePrefix,
+} from "./analyzer/reorderer.js";
+export type {
+  ReorderInput,
+  ReorderOutput,
+} from "./analyzer/reorderer.js";
 
 export { StabilityTracker } from "./analyzer/stability-tracker.js";
 
@@ -57,6 +73,7 @@ export type {
   ModelId,
   ModelPricing,
   PrefixDiff,
+  ReorderDiagnostic,
   StabilityEntry,
   StabilityReport,
   WarningEvent,

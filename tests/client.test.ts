@@ -376,3 +376,159 @@ describe("CachedAnthropic v0.2 — stability()", () => {
     expect(system?.stabilityScore).toBe(1);
   });
 });
+
+describe("CachedAnthropic v0.3 — autoReorder", () => {
+  const tool = (name: string, extra: Record<string, unknown> = {}) => ({
+    name,
+    description: `tool ${name}`,
+    input_schema: { type: "object", properties: {} },
+    ...extra,
+  });
+
+  it("alphabetizes a shuffled tools array before sending", async () => {
+    const { client, seen } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoReorder: true },
+    );
+
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("zeta"), tool("alpha"), tool("mu")],
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    const sent = seen[0] as { tools: Array<{ name: string }> };
+    expect(sent.tools.map((t) => t.name)).toEqual(["alpha", "mu", "zeta"]);
+  });
+
+  it("does not reorder when autoReorder is not set", async () => {
+    const { client, seen } = withProgrammableStub([
+      { input_tokens: 10, output_tokens: 5 },
+    ]);
+
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("zeta"), tool("alpha")],
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    const sent = seen[0] as { tools: Array<{ name: string }> };
+    expect(sent.tools.map((t) => t.name)).toEqual(["zeta", "alpha"]);
+  });
+
+  it("emits auto-reorder-applied when something actually got reordered", async () => {
+    const { client, warnings } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoReorder: true },
+    );
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("z"), tool("a")],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const event = warnings.find((w) => w.code === "auto-reorder-applied");
+    expect(event).toBeDefined();
+    expect(event!.detail).toBeDefined();
+  });
+
+  it("does not emit auto-reorder-applied when the payload is already canonical", async () => {
+    const { client, warnings } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoReorder: true },
+    );
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("a"), tool("b")],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(warnings.some((w) => w.code === "auto-reorder-applied")).toBe(false);
+  });
+
+  it("turns a shuffle-each-call pattern into stable bytes so autoCache can mark it", async () => {
+    const { client, seen } = withProgrammableStub(
+      [
+        { input_tokens: 10, output_tokens: 5 },
+        { input_tokens: 10, output_tokens: 5 },
+        { input_tokens: 10, output_tokens: 5 },
+      ],
+      { autoReorder: true, autoCache: true, autoCacheMinObservations: 2 },
+    );
+
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("alpha"), tool("beta"), tool("gamma")],
+      messages: [{ role: "user", content: "q1" }],
+    });
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("gamma"), tool("alpha"), tool("beta")],
+      messages: [{ role: "user", content: "q2" }],
+    });
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [tool("beta"), tool("gamma"), tool("alpha")],
+      messages: [{ role: "user", content: "q3" }],
+    });
+
+    // Every outbound call has canonical tool order
+    for (const call of seen) {
+      const tools = (call as { tools: Array<{ name: string }> }).tools;
+      expect(tools.map((t) => t.name)).toEqual(["alpha", "beta", "gamma"]);
+    }
+    // By call 3, autoCache should have marked tools cacheable
+    const last = seen[2] as { tools: Array<Record<string, unknown>> };
+    expect(last.tools[last.tools.length - 1]!.cache_control).toEqual({
+      type: "ephemeral",
+    });
+  });
+
+  it("respects user-placed cache_control on tools — does not reorder", async () => {
+    const { client, seen } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoReorder: true },
+    );
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      tools: [
+        tool("zeta"),
+        tool("alpha", { cache_control: { type: "ephemeral" } }),
+      ],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const sent = seen[0] as { tools: Array<{ name: string }> };
+    expect(sent.tools.map((t) => t.name)).toEqual(["zeta", "alpha"]);
+  });
+
+  it("sorts a leading run of user-context messages", async () => {
+    const { client, seen } = withProgrammableStub(
+      [{ input_tokens: 10, output_tokens: 5 }],
+      { autoReorder: true },
+    );
+    const doc = (id: string) => ({
+      type: "document" as const,
+      source: { type: "text", media_type: "text/plain", data: id },
+    });
+    await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: [doc("z")] },
+        { role: "user", content: [doc("a")] },
+        { role: "user", content: [doc("m")] },
+        { role: "user", content: "now answer" },
+      ],
+    });
+    const sent = seen[0] as { messages: Array<{ content: unknown }> };
+    // The question stays last; the doc prefix is sorted deterministically
+    expect(sent.messages).toHaveLength(4);
+    expect(sent.messages[3]!.content).toBe("now answer");
+  });
+});

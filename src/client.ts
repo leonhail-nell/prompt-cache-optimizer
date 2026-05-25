@@ -12,6 +12,12 @@
  *                       of what changed in the cacheable prefix.
  *   - client.stability(): inspect per-segment stability.
  *
+ * v0.3 additions (all opt-in):
+ *   - autoReorder:      canonicalize order-insensitive parts of the request
+ *                       (tools, runs of document/image content blocks,
+ *                       leading user-context message prefix) before sending,
+ *                       so a shuffled payload still hits the cache.
+ *
  * The wrapper is intentionally non-invasive. If you remove the import,
  * your code still works — you just lose visibility.
  */
@@ -21,6 +27,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { autoPlaceBreakpoints } from "./analyzer/auto-placer.js";
 import { hasAnyCacheControl } from "./analyzer/breakpoint-placer.js";
 import { snapshotRequest } from "./analyzer/fingerprint.js";
+import { applyAutoReorder } from "./analyzer/reorderer.js";
 import { StabilityTracker } from "./analyzer/stability-tracker.js";
 import { diffSnapshots } from "./diagnostics/diff.js";
 import { safeEmit } from "./diagnostics/warnings.js";
@@ -104,8 +111,8 @@ export class CachedAnthropic {
     create: async (
       params: Anthropic.MessageCreateParamsNonStreaming,
     ): Promise<CachedMessage> => {
-      // Take a snapshot of what the USER sent (pre-modification) so the
-      // stability tracker and diff engine see the original payload.
+      // Take a typed view of what the USER sent. We may rewrite this below
+      // (auto-reorder, auto-place) before forwarding to the SDK.
       const userSystem = params.system as
         | string
         | Array<{ type: "text"; text: string }>
@@ -118,33 +125,72 @@ export class CachedAnthropic {
         content: string | Array<{ type: string; [k: string]: unknown }>;
       }>;
 
+      // STEP 1 — auto-reorder. We do this FIRST so that the stability
+      // tracker, the auto-placer, and the cache-miss diagnostic all see the
+      // canonicalized form (i.e. what actually goes over the wire).
+      let workingSystem = userSystem;
+      let workingTools = userTools;
+      let workingMessages = userMessages;
+      if (this.opts.autoReorder) {
+        const reordered = applyAutoReorder({
+          system: workingSystem,
+          tools: workingTools,
+          messages: workingMessages,
+        });
+        workingSystem = reordered.system;
+        workingTools = reordered.tools;
+        workingMessages = reordered.messages as typeof workingMessages;
+        if (reordered.diagnostics.length > 0) {
+          safeEmit(this.opts.onWarning, {
+            code: "auto-reorder-applied",
+            message:
+              "Auto-reorder canonicalized order-insensitive parts of the request to preserve the cache prefix: " +
+              reordered.diagnostics.map((d) => d.summary).join("; "),
+            detail: { diagnostics: reordered.diagnostics },
+          });
+        }
+      }
+
+      // STEP 2 — snapshot the canonical form so the tracker reflects what
+      // actually went over the wire.
       const previousSnapshot = this.tracker.previousSnapshot();
       const currentSnapshot = snapshotRequest({
-        system: userSystem,
-        tools: userTools,
-        messages: userMessages,
+        system: workingSystem,
+        tools: workingTools,
+        messages: workingMessages,
       });
       this.tracker.observe(currentSnapshot);
 
-      // Decide what to actually send: maybe auto-place breakpoints.
-      let outgoing: Anthropic.MessageCreateParamsNonStreaming = params;
+      // STEP 3 — decide what to actually send: maybe auto-place breakpoints.
+      // Start from a shallow copy of the input but with the canonicalized
+      // segments swapped in.
+      let outgoing: Anthropic.MessageCreateParamsNonStreaming = {
+        ...params,
+        ...(workingSystem !== undefined
+          ? { system: workingSystem as unknown as Anthropic.MessageCreateParamsNonStreaming["system"] }
+          : {}),
+        ...(workingTools !== undefined
+          ? { tools: workingTools as unknown as Anthropic.MessageCreateParamsNonStreaming["tools"] }
+          : {}),
+        messages: workingMessages as unknown as Anthropic.MessageCreateParamsNonStreaming["messages"],
+      };
       const userMarkedCache = hasAnyCacheControl({
-        system: userSystem,
-        messages: userMessages,
-        tools: userTools,
+        system: workingSystem,
+        messages: workingMessages,
+        tools: workingTools,
       });
 
       if (this.opts.autoCache && !userMarkedCache) {
         const placed = autoPlaceBreakpoints({
-          system: userSystem,
-          tools: userTools,
-          messages: userMessages,
+          system: workingSystem,
+          tools: workingTools,
+          messages: workingMessages,
           tracker: this.tracker,
           minObservations: this.opts.autoCacheMinObservations ?? 2,
         });
         if (placed.placements.length > 0) {
           outgoing = {
-            ...params,
+            ...outgoing,
             ...(placed.system !== undefined
               ? { system: placed.system as unknown as Anthropic.MessageCreateParamsNonStreaming["system"] }
               : {}),

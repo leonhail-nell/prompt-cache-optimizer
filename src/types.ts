@@ -59,9 +59,33 @@ export interface WarningEvent {
     | "no-cache-control-found"
     | "cache-write-without-read"
     /** Info-level: v0.2 auto-placement applied a breakpoint we previously hadn't. */
-    | "auto-placement-applied";
+    | "auto-placement-applied"
+    /** Info-level: v0.3 auto-reorder canonicalized something to preserve the cache prefix. */
+    | "auto-reorder-applied";
   message: string;
   /** Optional structured detail. */
+  detail?: Record<string, unknown>;
+}
+
+/**
+ * v0.3: structured description of a single reorder action the wrapper took
+ * before sending the request. Attached to the `auto-reorder-applied` warning.
+ */
+export interface ReorderDiagnostic {
+  /**
+   * Which segment was reordered:
+   *   - "tools"                     — the tools array was alphabetized by name
+   *   - "messages-prefix"           — a leading run of context-only user
+   *                                   messages was sorted by content fingerprint
+   *   - `messages[N].content`       — same-type content blocks within message N
+   *                                   were sorted (only "document"/"image" runs)
+   */
+  segment: "tools" | "messages-prefix" | string;
+  /** Short, single-line explanation suitable for logging. */
+  summary: string;
+  /** Number of elements that ended up at a different index after the reorder. */
+  itemsMoved: number;
+  /** Optional structured detail (original/new indices, etc.). */
   detail?: Record<string, unknown>;
 }
 
@@ -142,6 +166,21 @@ export interface CachedAnthropicOptions {
    * detail. Adds a small per-call CPU cost. Default: false (opt-in).
    */
   diagnoseMisses?: boolean;
+  /**
+   * v0.3: when true, the wrapper canonicalizes order-insensitive parts of the
+   * request before sending it so a "slightly shuffled" payload still hits the
+   * cache. Specifically:
+   *   - tools are alphabetized by name
+   *   - runs of same-type reorderable blocks (document/image) within a single
+   *     message are sorted by content fingerprint
+   *   - a leading run of context-only user messages (RAG pattern: user
+   *     messages containing only document/image blocks) is sorted by content
+   *     fingerprint
+   * Text, tool_use, tool_result, and thinking blocks are never moved. The
+   * wrapper also never reorders any segment that already carries a
+   * `cache_control` marker — explicit intent always wins. Default: false (opt-in).
+   */
+  autoReorder?: boolean;
 }
 
 /** Per-million-token pricing in USD. */

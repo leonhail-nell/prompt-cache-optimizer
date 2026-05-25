@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+Headline feature — opt-in, fully backwards compatible with v0.2.
+
+- **Auto-reorder**: pass `autoReorder: true` and the wrapper canonicalizes order-insensitive parts of the request before sending so a "slightly shuffled" payload still hits the cache. Specifically:
+  - Tools are alphabetized by `name` (most common cause of silent cache misses — different tool order across calls).
+  - Within a single message, consecutive runs of same-type reorderable blocks (`document`, `image`) are sorted by content fingerprint. Text, `tool_use`, `tool_result`, and `thinking` blocks are never moved.
+  - A leading run of context-only user messages (the classic RAG pattern: user messages whose content is purely `document`/`image` blocks) is sorted by content fingerprint. The scan stops at the first message that breaks the pattern.
+- **Safety invariants**: never reorders any segment that already carries a `cache_control` marker (explicit intent always wins), never moves text or `tool_use`/`tool_result`/`thinking` blocks, never touches assistant messages, never mutates input.
+- New `auto-reorder-applied` info-level warning event listing exactly what got moved and why.
+- New public helpers exported: `applyAutoReorder`, `canonicalizeTools`, `canonicalizeMessageContent`, `canonicalizeMessagePrefix`.
+- New public type: `ReorderDiagnostic`.
+- Pipeline order in the client: auto-reorder runs FIRST, then stability tracking observes the canonical form, then auto-placement decides what to cache — so per-segment stability scores reflect what was actually sent over the wire.
+- Zero new runtime dependencies (still just `@anthropic-ai/sdk` as peer dep).
+
 ## 0.2.1
 
 - Refreshed the README screenshot and caption to show the actual v0.2 output (auto-placement, cache-miss diagnostic with prefix diff, and per-segment stability score). No code changes.
@@ -51,6 +66,5 @@ Initial release.
 
 ## Unreleased / planned
 
-- v0.3: safe message/tool reordering (so a slightly shuffled tool array still hits cache)
 - v0.4: OpenAI + Gemini prompt-caching support
 - v1.0: persistent stats adapter (write hit-rate to disk / Redis), middleware mode for Express/Fastify
