@@ -17,6 +17,12 @@
  *   - applyAutoReorder (functional canonicalization)
  *   - canonicalizeTools / canonicalizeMessageContent / canonicalizeMessagePrefix
  *   - ReorderDiagnostic type
+ *
+ * Added in v0.4:
+ *   - CachedOpenAI (wraps `openai`)
+ *   - CachedGemini (wraps `@google/genai`)
+ *   - OpenAI + Gemini pricing tables, usage extractors, option types
+ *   - 'prompt-too-small-for-cache' and 'gemini-cache-applied' warning codes
  */
 
 export { CachedAnthropic } from "./client.js";
@@ -64,6 +70,46 @@ export { computeCacheInfo } from "./tracking/hit-rate.js";
 export { StatsAggregator } from "./tracking/stats.js";
 
 export { lookupPricing, KNOWN_MODELS } from "./pricing/models.js";
+
+/* -------------------------------------------------------------------------- */
+/* v0.4: OpenAI                                                                */
+/* -------------------------------------------------------------------------- */
+
+export { CachedOpenAI } from "./providers/openai/client.js";
+export type {
+  CachedChatCompletion,
+  OpenAIChatCompletion,
+} from "./providers/openai/client.js";
+export {
+  lookupOpenAIPricing,
+  KNOWN_OPENAI_MODELS,
+} from "./providers/openai/pricing.js";
+export {
+  computeOpenAICacheInfo,
+} from "./providers/openai/usage.js";
+export type { OpenAIUsage } from "./providers/openai/usage.js";
+export type { CachedOpenAIOptions } from "./providers/openai/types.js";
+export { OPENAI_CACHE_MIN_TOKENS } from "./providers/openai/types.js";
+
+/* -------------------------------------------------------------------------- */
+/* v0.4: Gemini                                                                */
+/* -------------------------------------------------------------------------- */
+
+export { CachedGemini } from "./providers/gemini/client.js";
+export type {
+  CachedGeminiResponse,
+  GeminiResponse,
+  GeminiCachedContent,
+} from "./providers/gemini/client.js";
+export {
+  lookupGeminiPricing,
+  KNOWN_GEMINI_MODELS,
+} from "./providers/gemini/pricing.js";
+export {
+  computeGeminiCacheInfo,
+} from "./providers/gemini/usage.js";
+export type { GeminiUsageMetadata } from "./providers/gemini/usage.js";
+export type { CachedGeminiOptions } from "./providers/gemini/types.js";
 
 export type {
   AnthropicUsage,

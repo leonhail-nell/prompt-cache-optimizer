@@ -1,7 +1,7 @@
 {
   "name": "prompt-cache-optimizer",
-  "version": "0.3.0",
-  "description": "Drop-in wrapper for the Anthropic SDK that auto-places cache_control breakpoints, canonicalizes shuffled tools/RAG context so the cache still hits, measures cache hit rate, and explains exactly why your prompt caching silently broke.",
+  "version": "0.4.0",
+  "description": "Drop-in wrappers for the Anthropic, OpenAI, and Gemini SDKs that measure prompt cache hit rate, surface dollar savings, canonicalize shuffled tools/RAG context so the cache still hits, auto-place Anthropic cache_control breakpoints, and explain exactly why caching silently broke.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -25,11 +25,16 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "example": "tsx examples/basic-chatbot.ts",
+    "example:openai": "tsx examples/openai-chatbot.ts",
+    "example:gemini": "tsx examples/gemini-rag.ts",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "anthropic",
     "claude",
+    "openai",
+    "gpt",
+    "gemini",
     "prompt-caching",
     "cache",
     "llm",
@@ -58,11 +63,23 @@
     }
   ],
   "peerDependencies": {
-    "@anthropic-ai/sdk": ">=0.27.0"
+    "@anthropic-ai/sdk": ">=0.27.0",
+    "openai": ">=4.0.0",
+    "@google/genai": ">=0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "openai": {
+      "optional": true
+    },
+    "@google/genai": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
+    "@google/genai": "^0.3.0",
     "@types/node": "^20.11.0",
+    "openai": "^4.60.0",
     "tsup": "^8.0.0",
     "tsx": "^4.7.0",
     "typescript": "^5.3.0",

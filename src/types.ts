@@ -61,7 +61,11 @@ export interface WarningEvent {
     /** Info-level: v0.2 auto-placement applied a breakpoint we previously hadn't. */
     | "auto-placement-applied"
     /** Info-level: v0.3 auto-reorder canonicalized something to preserve the cache prefix. */
-    | "auto-reorder-applied";
+    | "auto-reorder-applied"
+    /** v0.4: prompt is below provider's automatic-caching minimum (OpenAI). */
+    | "prompt-too-small-for-cache"
+    /** v0.4: a Gemini explicit CachedContent was created or referenced. */
+    | "gemini-cache-applied";
   message: string;
   /** Optional structured detail. */
   detail?: Record<string, unknown>;

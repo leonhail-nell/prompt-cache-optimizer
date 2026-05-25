@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+
+Headline feature — multi-provider support. Fully backwards compatible with v0.3.
+
+- **`CachedOpenAI`** — drop-in wrapper around the `openai` SDK. Same `cacheInfo` shape on every response, same `client.stats()` / `client.stability()` / `client.resetStats()` surface. OpenAI's cache is automatic so there is no `autoCache` option, but `autoReorder: true` still alphabetizes the tools array to keep the automatic cache hitting across shuffled calls.
+- **`CachedGemini`** — drop-in wrapper around `@google/genai`. Supports both implicit caching (Gemini 2.5+ automatic) and explicit caching (via `client.caches.create/get/delete/list/update` pass-throughs, and `config.cachedContent: name` on `generateContent`). `autoReorder: true` alphabetizes each tool entry's `functionDeclarations[]` by name.
+- **OpenAI + Gemini pricing tables** built in. Override per-instance with `pricingOverride`. Last verified against `openai.com/api/pricing` and `ai.google.dev/pricing` on May 25, 2026.
+- **New warning codes**: `prompt-too-small-for-cache` (OpenAI: prompt below the 1024-token automatic-cache minimum) and `gemini-cache-applied` (Gemini: an explicit CachedContent was created or referenced on a request).
+- **New public helpers exported**: `CachedOpenAI`, `CachedGemini`, `CachedOpenAIOptions`, `CachedGeminiOptions`, `OpenAIUsage`, `GeminiUsageMetadata`, `computeOpenAICacheInfo`, `computeGeminiCacheInfo`, `lookupOpenAIPricing`, `lookupGeminiPricing`, `KNOWN_OPENAI_MODELS`, `KNOWN_GEMINI_MODELS`, `OPENAI_CACHE_MIN_TOKENS`.
+- **Peer dependencies**: `openai` and `@google/genai` are added as OPTIONAL peer dependencies (via `peerDependenciesMeta`). You only need to install the SDK for the provider you use; `CachedAnthropic` users carry no new install footprint.
+- **Lazy SDK loading**: the OpenAI and Gemini SDKs are dynamically imported on the first call to `chat.completions.create` / `models.generateContent`. Simply importing `prompt-cache-optimizer` doesn't require either to be installed.
+- **Streaming**: still non-streaming only across all three providers (consistent with v0.1–0.3). Streaming wrappers planned for v0.5.
+- **Auto-managed Gemini explicit caching** (wrapper creates/refreshes/deletes `CachedContent` objects on its own when prefixes are stable) is deferred to v0.5 — explicit cache lifecycle management deserves its own focused release.
+- New examples: `examples/openai-chatbot.ts` and `examples/gemini-rag.ts`.
+
 ## 0.3.0
 
 Headline feature — opt-in, fully backwards compatible with v0.2.
@@ -66,5 +81,5 @@ Initial release.
 
 ## Unreleased / planned
 
-- v0.4: OpenAI + Gemini prompt-caching support
+- v0.5: streaming wrappers for all three providers; auto-managed Gemini explicit caching (`CachedContent` lifecycle)
 - v1.0: persistent stats adapter (write hit-rate to disk / Redis), middleware mode for Express/Fastify

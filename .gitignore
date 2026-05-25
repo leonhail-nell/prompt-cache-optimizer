@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-v2/
 dist-v3/
+dist-v4/
 coverage/
 .env
 .env.local

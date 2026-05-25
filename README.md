@@ -6,35 +6,37 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](tsconfig.json)
 
-Drop-in wrapper for the Anthropic SDK that makes prompt caching effortless. Auto-places `cache_control` breakpoints based on observed prompt stability, canonicalizes shuffled tools and RAG document order so a "slightly different" payload still hits the cache, measures real cache hit rate from the response usage object, and explains exactly what changed when your cache silently breaks.
+Drop-in wrappers for the Anthropic, OpenAI, and Gemini SDKs that make prompt caching effortless. Measure real cache hit rate from the response usage object, attach dollar savings to every call, canonicalize shuffled tools and RAG document order so a "slightly different" payload still hits the cache, and (for Anthropic) auto-place `cache_control` breakpoints based on observed stability.
 
 ![Real output: autoCache marks the system prompt cacheable after observing it twice, the next 3 calls hit the cache (~1569 cached tokens each, $0.0042 saved per call), and a deliberate drift triggers the cache-miss diagnostic showing the exact characters that changed.](assets/stats-screenshot.png)
 
 > Real output from `bun run example`. Six calls — autoCache marks the system prompt cacheable after observing it twice, calls 3–5 hit the cache (~1569 cached tokens each), and a final deliberate drift triggers the diagnostic showing the exact characters that changed. `client.stability()` reports `system score=0.80` cumulative across the run.
 
-> Status: v0.3 — adds safe auto-reorder of shuffled tools, RAG document blocks, and leading user-context message prefixes. Backwards compatible with v0.1 and v0.2.
+> Status: v0.4 — adds drop-in wrappers for OpenAI and Gemini alongside Anthropic. One library, three providers, one consistent `cacheInfo`/`stats()`/`stability()` surface. Backwards compatible with v0.1–0.3.
 
 ## Why this exists
 
-Anthropic prompt caching gives you a 90% discount on the cached portion of your prompt. But the API is finicky:
+All three frontier providers now offer prompt caching:
 
-- A misplaced `cache_control` breakpoint silently degrades to a full-price call
-- You only get 4 breakpoints per request — they have to be spent well
-- Cache prefixes break if message order shifts even slightly (tools array reordered, RAG retriever returns the same documents in a different order, etc.)
-- The default TTL is 5 minutes; lots of setups silently regress when calls come in slower than that
-- The only way to know it's working is to parse `cache_read_input_tokens` yourself
+- **Anthropic** — 90% discount on the cached portion. Marker-based (`cache_control: { type: "ephemeral" }`), positional, 4-breakpoint budget, 5-minute TTL.
+- **OpenAI** — 50% discount on the cached portion (75% for o-series). Automatic for prompts ≥ 1024 tokens, no markers — but silently doesn't trigger below the threshold or when your tools array shuffles.
+- **Gemini** — 75% discount on the cached portion. Two modes: implicit (automatic for 2.5+) and explicit (`CachedContent` API with manual lifecycle).
 
-`prompt-cache-optimizer` handles all of that for you.
+All three are fragile in similar ways: a misplaced byte, a reshuffled tools array, a TTL expiry, an upstream service that reorders retrieved documents — and your prompt cache silently degrades to a full-price call. The only way to know it's working is to dig into the response usage object yourself.
+
+`prompt-cache-optimizer` handles all of that for you, with the same surface for every provider.
 
 ## Install
 
 ```bash
+# Pick the provider(s) you actually use. OpenAI and Gemini SDKs are
+# optional peer deps — install only what you need.
 npm install prompt-cache-optimizer @anthropic-ai/sdk
-# or
-bun add prompt-cache-optimizer @anthropic-ai/sdk
+npm install prompt-cache-optimizer openai
+npm install prompt-cache-optimizer @google/genai
 ```
 
-## Quick start (v0.3 — auto-placement + auto-reorder)
+## Quick start: Anthropic (auto-placement + auto-reorder)
 
 ```ts
 import { CachedAnthropic } from "prompt-cache-optimizer";
@@ -67,7 +69,96 @@ console.log(client.stability());
 
 The first call always misses (that's when the cache is written). Once the wrapper has seen the system prompt twice unchanged, it auto-marks it cacheable and subsequent calls hit. No code changes needed when your prompt shape evolves — auto-placement re-evaluates each call.
 
-## How auto-placement decides what to cache
+## Quick start: OpenAI
+
+```ts
+import { CachedOpenAI } from "prompt-cache-optimizer";
+
+const client = new CachedOpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+  autoReorder: true,         // ← alphabetize tools so shuffled lists still hit cache
+  diagnoseMisses: true,
+  warnIfHitRateBelow: 0.5,
+  // warnIfPromptTooSmall is on by default — surfaces calls below OpenAI's
+  // 1024-token automatic-cache minimum so you know why no caching happens.
+});
+
+const response = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    { role: "system", content: longSystemPrompt },
+    { role: "user", content: question },
+  ],
+  tools: [...],
+});
+
+console.log(response.cacheInfo);
+// { hit: true, cachedTokens: 7420, uncachedTokens: 312, dollarsSaved: 0.0093, ... }
+
+console.log(client.stats());
+// { totalCalls: 5, hitRate: 0.8, totalCachedTokens: 29680, dollarsSaved: 0.037, ... }
+```
+
+OpenAI's cache is automatic for prompts ≥ 1024 tokens — there is no `autoCache` to enable (and no `cache_control` markers to place). The wrapper measures from `usage.prompt_tokens_details.cached_tokens`, attaches per-call savings, accumulates rolling stats, and (with `autoReorder: true`) canonicalizes the tools array so a shuffled list still hits.
+
+## Quick start: Gemini
+
+```ts
+import { CachedGemini } from "prompt-cache-optimizer";
+
+const client = new CachedGemini({
+  apiKey: process.env.GOOGLE_API_KEY!,
+  autoReorder: true,
+  diagnoseMisses: true,
+});
+
+// Implicit caching (Gemini 2.5+ automatic): just call it.
+const response = await client.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: [{ role: "user", parts: [{ text: question }] }],
+  config: { systemInstruction: longSystemInstruction },
+});
+console.log(response.cacheInfo);
+// { hit: true, cachedTokens: 4800, uncachedTokens: 500, dollarsSaved: 0.00045, ... }
+
+// Explicit caching: create a CachedContent and reference it by name.
+const cache = await client.caches.create({
+  model: "gemini-2.5-flash",
+  config: {
+    contents: [{ role: "user", parts: [{ text: longContext }] }],
+    ttl: "300s",
+  },
+});
+
+const cached = await client.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: [{ role: "user", parts: [{ text: question }] }],
+  config: { cachedContent: cache.name },
+});
+console.log(cached.cacheInfo);
+// → hit: true, cachedTokens: (all of longContext)
+
+await client.caches.delete({ name: cache.name }); // clean up when done
+```
+
+Gemini exposes the SDK's `caches.create/get/delete/list/update` pass-through so you can manage `CachedContent` lifecycles through the same client. Auto-managed explicit caching (the wrapper creates and refreshes `CachedContent` objects on its own when prefixes are stable) is on the v0.5 roadmap.
+
+## What you get with every provider
+
+Regardless of provider, every wrapped client exposes the same surface:
+
+- `response.cacheInfo` — `{ hit, cachedTokens, uncachedTokens, cacheWriteTokens, dollarsSaved, dollarsSpent }` on every call.
+- `client.stats()` — rolling aggregate: `totalCalls`, `hitRate`, `totalCachedTokens`, `dollarsSaved`, etc.
+- `client.stability()` — per-segment stability report so you can debug which part of your prompt is drifting before it costs money.
+- `client.resetStats()` — clears stats and stability history.
+- `autoReorder` — canonicalizes order-insensitive parts of the request so shuffled inputs still hit the cache.
+- `diagnoseMisses` — when the cache misses, attach a human-readable diff explaining what changed in the prefix.
+- Built-in pricing tables — override per-instance with `pricingOverride`.
+- Passive warning events via `onWarning` — never throws, never blocks a request.
+
+## How Anthropic auto-placement decides what to cache
+
+(Anthropic only — OpenAI's cache is automatic and has no markers, and Gemini's explicit `CachedContent` is managed by you.)
 
 On every call the wrapper:
 
@@ -196,12 +287,14 @@ new CachedAnthropic({
 
 The client emits passive warnings (never throws, never blocks a request):
 
-- `no-cache-control-found` — you forgot to mark anything cacheable AND auto-cache hasn't activated yet
+- `no-cache-control-found` — (Anthropic) you forgot to mark anything cacheable AND auto-cache hasn't activated yet
 - `cache-write-without-read` — your prefix changed call-over-call; cache is broken (carries a diff when `diagnoseMisses: true`)
 - `low-hit-rate` — rolling hit rate fell below your threshold
 - `unknown-model` — pricing unknown, so dollar accounting is skipped
-- `auto-placement-applied` — info-level: the wrapper just placed cache_control on a newly-stable segment
-- `auto-reorder-applied` — info-level (v0.3): the wrapper canonicalized order-insensitive parts of the request so the cache prefix would still match
+- `auto-placement-applied` — info-level (Anthropic): the wrapper just placed cache_control on a newly-stable segment
+- `auto-reorder-applied` — info-level: the wrapper canonicalized order-insensitive parts of the request so the cache prefix would still match
+- `prompt-too-small-for-cache` — (OpenAI, v0.4) the prompt is below OpenAI's 1024-token automatic-cache minimum
+- `gemini-cache-applied` — info-level (Gemini, v0.4): an explicit `CachedContent` was created or referenced on this call
 
 Route them anywhere:
 
@@ -216,12 +309,19 @@ new CachedAnthropic({
 
 - ~~**v0.2** — auto-placement of `cache_control` breakpoints based on observed prompt stability~~ ✅ shipped
 - ~~**v0.3** — safe message and tool reordering to maximize the stable prefix~~ ✅ shipped
-- **v0.4** — OpenAI and Gemini prompt caching support
+- ~~**v0.4** — OpenAI and Gemini prompt caching support~~ ✅ shipped
+- **v0.5** — streaming wrappers; auto-managed Gemini `CachedContent` lifecycle
 - **v1.0** — persistent stats adapter, middleware mode
 
 ## Zero runtime dependencies
 
-`@anthropic-ai/sdk` is a peer dependency. `prompt-cache-optimizer` itself has zero runtime deps. v0.2 uses Node's built-in `node:crypto` for fingerprinting.
+`prompt-cache-optimizer` itself has zero runtime deps and uses Node's built-in `node:crypto` for fingerprinting. The provider SDKs are peer dependencies:
+
+- `@anthropic-ai/sdk` — required for `CachedAnthropic`
+- `openai` — optional peer dep, required only if you use `CachedOpenAI`
+- `@google/genai` — optional peer dep, required only if you use `CachedGemini`
+
+The OpenAI and Gemini SDKs are dynamically imported on first call — simply importing `prompt-cache-optimizer` doesn't require either to be installed.
 
 ## Contributing
 
