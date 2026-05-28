@@ -1,7 +1,7 @@
 {
   "name": "prompt-cache-optimizer",
-  "version": "0.4.0",
-  "description": "Drop-in wrappers for the Anthropic, OpenAI, and Gemini SDKs that measure prompt cache hit rate, surface dollar savings, canonicalize shuffled tools/RAG context so the cache still hits, auto-place Anthropic cache_control breakpoints, and explain exactly why caching silently broke.",
+  "version": "0.5.0",
+  "description": "Drop-in wrappers for the Anthropic, OpenAI, and Gemini SDKs (non-streaming AND streaming) that measure prompt cache hit rate, surface dollar savings, auto-manage Gemini CachedContent lifecycles, canonicalize shuffled tools/RAG context, auto-place Anthropic cache_control breakpoints, and explain exactly why caching silently broke.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -27,6 +27,8 @@
     "example": "tsx examples/basic-chatbot.ts",
     "example:openai": "tsx examples/openai-chatbot.ts",
     "example:gemini": "tsx examples/gemini-rag.ts",
+    "example:streaming": "tsx examples/streaming-all-three.ts",
+    "example:gemini-auto": "tsx examples/gemini-auto-cache.ts",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [

@@ -42,4 +42,26 @@ export interface CachedGeminiOptions {
    * human-readable diff of what changed. Default false (opt-in).
    */
   diagnoseMisses?: boolean;
+  /**
+   * v0.5: auto-managed explicit CachedContent. When true, the wrapper
+   * observes the stability of `config.systemInstruction` across calls
+   * and creates a `CachedContent` once an instruction has been seen
+   * unchanged for at least `autoCacheMinObservations` calls in a row.
+   * Subsequent matching calls automatically reference the cache via
+   * `config.cachedContent` and drop `systemInstruction`. Never overrides
+   * an explicit `config.cachedContent`. Default: false (opt-in).
+   */
+  autoCache?: boolean;
+  /**
+   * v0.5: how many consecutive observations a systemInstruction must
+   * survive before the auto-cache manager creates a CachedContent for
+   * it. Default: 2. Higher = more conservative.
+   */
+  autoCacheMinObservations?: number;
+  /**
+   * v0.5: TTL in seconds applied to auto-created CachedContents.
+   * Default: 300 (Gemini's typical implicit TTL). Set higher for
+   * long-lived chat sessions to avoid create-churn.
+   */
+  autoCacheTtl?: number;
 }

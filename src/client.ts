@@ -18,6 +18,12 @@
  *                       leading user-context message prefix) before sending,
  *                       so a shuffled payload still hits the cache.
  *
+ * v0.5 additions:
+ *   - messages.stream(): wrap Anthropic's MessageStream. The returned
+ *                        CachedStream is async-iterable for chunk-by-chunk
+ *                        consumption AND exposes .final() resolving with
+ *                        the full cacheInfo + final Message.
+ *
  * The wrapper is intentionally non-invasive. If you remove the import,
  * your code still works — you just lose visibility.
  */
@@ -26,9 +32,10 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import { autoPlaceBreakpoints } from "./analyzer/auto-placer.js";
 import { hasAnyCacheControl } from "./analyzer/breakpoint-placer.js";
-import { snapshotRequest } from "./analyzer/fingerprint.js";
+import { snapshotRequest, type RequestSnapshot } from "./analyzer/fingerprint.js";
 import { applyAutoReorder } from "./analyzer/reorderer.js";
 import { StabilityTracker } from "./analyzer/stability-tracker.js";
+import { CachedStream } from "./core/cached-stream.js";
 import { diffSnapshots } from "./diagnostics/diff.js";
 import { safeEmit } from "./diagnostics/warnings.js";
 import { lookupPricing } from "./pricing/models.js";
@@ -104,235 +111,281 @@ export class CachedAnthropic {
   }
 
   /**
-   * Mirror of `anthropic.messages` with a wrapped `create`. We expose only
-   * `create` for v0.1; streaming arrives in a later version.
+   * Pre-send pipeline: auto-reorder → snapshot → observe → auto-place.
+   * Shared between `messages.create` and `messages.stream`. Returns the
+   * params we should actually forward to the SDK plus the snapshots
+   * needed for cache-miss diagnostics on the way back.
+   */
+  private _prepareOutgoing<
+    P extends
+      | Anthropic.MessageCreateParamsNonStreaming
+      | Anthropic.MessageStreamParams,
+  >(
+    params: P,
+  ): {
+    outgoing: P;
+    previousSnapshot: RequestSnapshot | undefined;
+    currentSnapshot: RequestSnapshot;
+  } {
+    const userSystem = params.system as
+      | string
+      | Array<{ type: "text"; text: string }>
+      | undefined;
+    const userTools = params.tools as
+      | Array<{ [k: string]: unknown }>
+      | undefined;
+    const userMessages = params.messages as Array<{
+      role: "user" | "assistant";
+      content: string | Array<{ type: string; [k: string]: unknown }>;
+    }>;
+
+    // STEP 1 — auto-reorder. We do this FIRST so that the stability
+    // tracker, the auto-placer, and the cache-miss diagnostic all see the
+    // canonicalized form (i.e. what actually goes over the wire).
+    let workingSystem = userSystem;
+    let workingTools = userTools;
+    let workingMessages = userMessages;
+    if (this.opts.autoReorder) {
+      const reordered = applyAutoReorder({
+        system: workingSystem,
+        tools: workingTools,
+        messages: workingMessages,
+      });
+      workingSystem = reordered.system;
+      workingTools = reordered.tools;
+      workingMessages = reordered.messages as typeof workingMessages;
+      if (reordered.diagnostics.length > 0) {
+        safeEmit(this.opts.onWarning, {
+          code: "auto-reorder-applied",
+          message:
+            "Auto-reorder canonicalized order-insensitive parts of the request to preserve the cache prefix: " +
+            reordered.diagnostics.map((d) => d.summary).join("; "),
+          detail: { diagnostics: reordered.diagnostics },
+        });
+      }
+    }
+
+    // STEP 2 — snapshot the canonical form so the tracker reflects what
+    // actually went over the wire.
+    const previousSnapshot = this.tracker.previousSnapshot();
+    const currentSnapshot = snapshotRequest({
+      system: workingSystem,
+      tools: workingTools,
+      messages: workingMessages,
+    });
+    this.tracker.observe(currentSnapshot);
+
+    // STEP 3 — start the outgoing payload with the canonicalized
+    // segments, then maybe auto-place breakpoints.
+    let outgoing = {
+      ...params,
+      ...(workingSystem !== undefined ? { system: workingSystem } : {}),
+      ...(workingTools !== undefined ? { tools: workingTools } : {}),
+      messages: workingMessages,
+    } as unknown as P;
+
+    const userMarkedCache = hasAnyCacheControl({
+      system: workingSystem,
+      messages: workingMessages,
+      tools: workingTools,
+    });
+
+    if (this.opts.autoCache && !userMarkedCache) {
+      const placed = autoPlaceBreakpoints({
+        system: workingSystem,
+        tools: workingTools,
+        messages: workingMessages,
+        tracker: this.tracker,
+        minObservations: this.opts.autoCacheMinObservations ?? 2,
+      });
+      if (placed.placements.length > 0) {
+        outgoing = {
+          ...outgoing,
+          ...(placed.system !== undefined ? { system: placed.system } : {}),
+          ...(placed.tools !== undefined ? { tools: placed.tools } : {}),
+          messages: placed.messages,
+        } as unknown as P;
+        const signature = placed.placements
+          .map((p) => p.position)
+          .sort()
+          .join(",");
+        if (signature !== this.lastAnnouncedPlacements) {
+          this.lastAnnouncedPlacements = signature;
+          safeEmit(this.opts.onWarning, {
+            code: "auto-placement-applied",
+            message: `Auto-placement set: ${placed.placements
+              .map((p) => p.position)
+              .join(", ")} (based on observed stability).`,
+            detail: { placements: placed.placements },
+          });
+        }
+      }
+    }
+
+    // One-time check: did the user mark anything cacheable at all (and
+    // auto-cache didn't fix it for them)?
+    const out = outgoing as unknown as {
+      system?: unknown;
+      messages: unknown;
+      tools?: unknown;
+    };
+    const finalHasCache =
+      userMarkedCache ||
+      hasAnyCacheControl({
+        system: out.system as
+          | string
+          | Array<{ type: "text"; text: string }>
+          | undefined,
+        messages: out.messages as Array<{
+          role: "user" | "assistant";
+          content: string | Array<{ type: string; [k: string]: unknown }>;
+        }>,
+        tools: out.tools as Array<{ [k: string]: unknown }> | undefined,
+      });
+
+    if (
+      !this.warnedAboutNoCacheControl &&
+      !finalHasCache &&
+      !this.opts.autoCache
+    ) {
+      this.warnedAboutNoCacheControl = true;
+      safeEmit(this.opts.onWarning, {
+        code: "no-cache-control-found",
+        message:
+          "No cache_control markers found in this request. prompt-cache-optimizer has nothing to optimize until you mark something cacheable. See `placeBreakpoints()` or set `autoCache: true`.",
+      });
+    }
+
+    return { outgoing, previousSnapshot, currentSnapshot };
+  }
+
+  /**
+   * Post-response pipeline: compute cacheInfo, fire cache-miss
+   * diagnostic, accumulate stats, emit hit-rate alert. Shared between
+   * non-streaming and streaming code paths.
+   */
+  private _processUsage(
+    model: string,
+    usage: AnthropicUsage,
+    previousSnapshot: RequestSnapshot | undefined,
+    currentSnapshot: RequestSnapshot,
+  ): CacheInfo {
+    const pricing = lookupPricing(model, this.opts.pricingOverride);
+    if (!pricing) {
+      safeEmit(this.opts.onWarning, {
+        code: "unknown-model",
+        message: `Pricing unknown for model "${model}" — dollar accounting will report 0 for this call.`,
+        detail: { model },
+      });
+    }
+    const cacheInfo = computeCacheInfo(usage, pricing);
+
+    // Cache write but no read suggests prefix changed call-over-call.
+    const priorStats = this.stats_.snapshot();
+    const hadPriorCacheActivity =
+      priorStats.totalCachedTokens > 0 ||
+      priorStats.totalCacheWriteTokens > 0;
+    if (
+      cacheInfo.cacheWriteTokens > 0 &&
+      cacheInfo.cachedTokens === 0 &&
+      hadPriorCacheActivity
+    ) {
+      const detail: Record<string, unknown> = {};
+      if (this.opts.diagnoseMisses && previousSnapshot) {
+        const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
+        if (diffs.length > 0) {
+          detail.diff = diffs;
+          detail.summary = diffs.map((d) => d.summary).join("; ");
+        }
+      }
+      safeEmit(this.opts.onWarning, {
+        code: "cache-write-without-read",
+        message:
+          "This call wrote to the cache but read nothing — your cacheable prefix likely changed since the last call. Common causes: tools reordered, retrieved docs shuffled, or the cache TTL (default 5 min) expired." +
+          (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
+        ...(Object.keys(detail).length > 0 ? { detail } : {}),
+      });
+    }
+
+    this.stats_.record(cacheInfo);
+
+    const threshold = this.opts.warnIfHitRateBelow ?? 0;
+    const window = this.opts.hitRateWindow ?? 20;
+    if (
+      threshold > 0 &&
+      this.stats_.rollingSampleCount() >= window &&
+      this.stats_.rollingHitRate() < threshold
+    ) {
+      safeEmit(this.opts.onWarning, {
+        code: "low-hit-rate",
+        message: `Rolling cache hit rate (${(
+          this.stats_.rollingHitRate() * 100
+        ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
+        detail: {
+          rollingHitRate: this.stats_.rollingHitRate(),
+          threshold,
+          window,
+        },
+      });
+    }
+    return cacheInfo;
+  }
+
+  /**
+   * Mirror of `anthropic.messages` with a wrapped `create` and a wrapped
+   * `stream` (v0.5). `create` is non-streaming; `stream` returns a
+   * CachedStream you can iterate AND await `.final()` on for cacheInfo.
    */
   public readonly messages = {
     create: async (
       params: Anthropic.MessageCreateParamsNonStreaming,
     ): Promise<CachedMessage> => {
-      // Take a typed view of what the USER sent. We may rewrite this below
-      // (auto-reorder, auto-place) before forwarding to the SDK.
-      const userSystem = params.system as
-        | string
-        | Array<{ type: "text"; text: string }>
-        | undefined;
-      const userTools = params.tools as
-        | Array<{ [k: string]: unknown }>
-        | undefined;
-      const userMessages = params.messages as Array<{
-        role: "user" | "assistant";
-        content: string | Array<{ type: string; [k: string]: unknown }>;
-      }>;
-
-      // STEP 1 — auto-reorder. We do this FIRST so that the stability
-      // tracker, the auto-placer, and the cache-miss diagnostic all see the
-      // canonicalized form (i.e. what actually goes over the wire).
-      let workingSystem = userSystem;
-      let workingTools = userTools;
-      let workingMessages = userMessages;
-      if (this.opts.autoReorder) {
-        const reordered = applyAutoReorder({
-          system: workingSystem,
-          tools: workingTools,
-          messages: workingMessages,
-        });
-        workingSystem = reordered.system;
-        workingTools = reordered.tools;
-        workingMessages = reordered.messages as typeof workingMessages;
-        if (reordered.diagnostics.length > 0) {
-          safeEmit(this.opts.onWarning, {
-            code: "auto-reorder-applied",
-            message:
-              "Auto-reorder canonicalized order-insensitive parts of the request to preserve the cache prefix: " +
-              reordered.diagnostics.map((d) => d.summary).join("; "),
-            detail: { diagnostics: reordered.diagnostics },
-          });
-        }
-      }
-
-      // STEP 2 — snapshot the canonical form so the tracker reflects what
-      // actually went over the wire.
-      const previousSnapshot = this.tracker.previousSnapshot();
-      const currentSnapshot = snapshotRequest({
-        system: workingSystem,
-        tools: workingTools,
-        messages: workingMessages,
-      });
-      this.tracker.observe(currentSnapshot);
-
-      // STEP 3 — decide what to actually send: maybe auto-place breakpoints.
-      // Start from a shallow copy of the input but with the canonicalized
-      // segments swapped in.
-      let outgoing: Anthropic.MessageCreateParamsNonStreaming = {
-        ...params,
-        ...(workingSystem !== undefined
-          ? { system: workingSystem as unknown as Anthropic.MessageCreateParamsNonStreaming["system"] }
-          : {}),
-        ...(workingTools !== undefined
-          ? { tools: workingTools as unknown as Anthropic.MessageCreateParamsNonStreaming["tools"] }
-          : {}),
-        messages: workingMessages as unknown as Anthropic.MessageCreateParamsNonStreaming["messages"],
-      };
-      const userMarkedCache = hasAnyCacheControl({
-        system: workingSystem,
-        messages: workingMessages,
-        tools: workingTools,
-      });
-
-      if (this.opts.autoCache && !userMarkedCache) {
-        const placed = autoPlaceBreakpoints({
-          system: workingSystem,
-          tools: workingTools,
-          messages: workingMessages,
-          tracker: this.tracker,
-          minObservations: this.opts.autoCacheMinObservations ?? 2,
-        });
-        if (placed.placements.length > 0) {
-          outgoing = {
-            ...outgoing,
-            ...(placed.system !== undefined
-              ? { system: placed.system as unknown as Anthropic.MessageCreateParamsNonStreaming["system"] }
-              : {}),
-            ...(placed.tools !== undefined
-              ? { tools: placed.tools as unknown as Anthropic.MessageCreateParamsNonStreaming["tools"] }
-              : {}),
-            messages: placed.messages as unknown as Anthropic.MessageCreateParamsNonStreaming["messages"],
-          };
-          // Only announce when the SET of placements changes — once we hit a
-          // steady-state ("system is cached"), repeating that on every call
-          // is noise.
-          const signature = placed.placements
-            .map((p) => p.position)
-            .sort()
-            .join(",");
-          if (signature !== this.lastAnnouncedPlacements) {
-            this.lastAnnouncedPlacements = signature;
-            safeEmit(this.opts.onWarning, {
-              code: "auto-placement-applied",
-              message: `Auto-placement set: ${placed.placements
-                .map((p) => p.position)
-                .join(", ")} (based on observed stability).`,
-              detail: { placements: placed.placements },
-            });
-          }
-        }
-      }
-
-      // One-time check: did the user mark anything cacheable at all (and
-      // auto-cache didn't fix it for them)?
-      const finalHasCache =
-        userMarkedCache ||
-        hasAnyCacheControl({
-          system: (outgoing.system as
-            | string
-            | Array<{ type: "text"; text: string }>
-            | undefined) ?? undefined,
-          messages: outgoing.messages as Array<{
-            role: "user" | "assistant";
-            content: string | Array<{ type: string; [k: string]: unknown }>;
-          }>,
-          tools: outgoing.tools as
-            | Array<{ [k: string]: unknown }>
-            | undefined,
-        });
-
-      // Suppress this warning when autoCache is on — the user opted into the
-      // auto path, and the wrapper just needs more observations before it
-      // can place anything. Firing this warning in that mode is contradictory.
-      if (
-        !this.warnedAboutNoCacheControl &&
-        !finalHasCache &&
-        !this.opts.autoCache
-      ) {
-        this.warnedAboutNoCacheControl = true;
-        safeEmit(this.opts.onWarning, {
-          code: "no-cache-control-found",
-          message:
-            "No cache_control markers found in this request. prompt-cache-optimizer has nothing to optimize until you mark something cacheable. See `placeBreakpoints()` or set `autoCache: true`.",
-        });
-      }
-
+      const { outgoing, previousSnapshot, currentSnapshot } =
+        this._prepareOutgoing(params);
       const response = await this.raw.messages.create(outgoing);
-
-      const pricing = lookupPricing(
+      const cacheInfo = this._processUsage(
         params.model,
-        this.opts.pricingOverride,
+        response.usage as AnthropicUsage,
+        previousSnapshot,
+        currentSnapshot,
       );
-
-      if (!pricing) {
-        safeEmit(this.opts.onWarning, {
-          code: "unknown-model",
-          message: `Pricing unknown for model "${params.model}" — dollar accounting will report 0 for this call.`,
-          detail: { model: params.model },
-        });
-      }
-
-      const usage = response.usage as AnthropicUsage;
-      const cacheInfo = computeCacheInfo(usage, pricing);
-
-      // Cache write but no read suggests prefix changed call-over-call.
-      // Only fire when we've already had cache activity on a PRIOR call —
-      // otherwise the very first cache write trips a misleading "prefix
-      // changed" warning when in fact the cache was just initialized.
-      const priorStats = this.stats_.snapshot();
-      const hadPriorCacheActivity =
-        priorStats.totalCachedTokens > 0 ||
-        priorStats.totalCacheWriteTokens > 0;
-      if (
-        cacheInfo.cacheWriteTokens > 0 &&
-        cacheInfo.cachedTokens === 0 &&
-        hadPriorCacheActivity
-      ) {
-        const detail: Record<string, unknown> = {};
-        if (this.opts.diagnoseMisses && previousSnapshot) {
-          const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
-          if (diffs.length > 0) {
-            detail.diff = diffs;
-            detail.summary = diffs.map((d) => d.summary).join("; ");
-          }
-        }
-        safeEmit(this.opts.onWarning, {
-          code: "cache-write-without-read",
-          message:
-            "This call wrote to the cache but read nothing — your cacheable prefix likely changed since the last call. Common causes: tools reordered, retrieved docs shuffled, or the cache TTL (default 5 min) expired." +
-            (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
-          ...(Object.keys(detail).length > 0 ? { detail } : {}),
-        });
-      }
-
-      this.stats_.record(cacheInfo);
-
-      // Rolling hit-rate alert
-      const threshold = this.opts.warnIfHitRateBelow ?? 0;
-      const window = this.opts.hitRateWindow ?? 20;
-      if (
-        threshold > 0 &&
-        this.stats_.rollingSampleCount() >= window &&
-        this.stats_.rollingHitRate() < threshold
-      ) {
-        safeEmit(this.opts.onWarning, {
-          code: "low-hit-rate",
-          message: `Rolling cache hit rate (${(
-            this.stats_.rollingHitRate() * 100
-          ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
-          detail: {
-            rollingHitRate: this.stats_.rollingHitRate(),
-            threshold,
-            window,
-          },
-        });
-      }
-
-      // Augment response (use defineProperty so we don't clobber the SDK's type)
       Object.defineProperty(response, "cacheInfo", {
         value: cacheInfo,
         enumerable: true,
         writable: false,
         configurable: false,
       });
-
       return response as CachedMessage;
+    },
+    /**
+     * v0.5: streaming wrapper. Returns a CachedStream that yields
+     * MessageStreamEvents and exposes `.final()` resolving with
+     * `{ cacheInfo, raw: Message }`.
+     */
+    stream: (
+      params: Anthropic.MessageStreamParams,
+    ): CachedStream<Anthropic.MessageStreamEvent, undefined, Anthropic.Message> => {
+      const { outgoing, previousSnapshot, currentSnapshot } =
+        this._prepareOutgoing(params);
+      const rawStream = this.raw.messages.stream(outgoing);
+      return new CachedStream<Anthropic.MessageStreamEvent, undefined, Anthropic.Message>(
+        rawStream,
+        {
+          initialState: undefined,
+          finalize: async () => {
+            // Anthropic's MessageStream already buffers the final
+            // message — we just ask it.
+            const finalMessage = await rawStream.finalMessage();
+            const cacheInfo = this._processUsage(
+              params.model,
+              finalMessage.usage as AnthropicUsage,
+              previousSnapshot,
+              currentSnapshot,
+            );
+            return { cacheInfo, raw: finalMessage };
+          },
+        },
+      );
     },
   };
 }

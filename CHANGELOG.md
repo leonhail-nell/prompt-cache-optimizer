@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+Headline features — streaming for all three providers, and auto-managed Gemini explicit caching. Fully backwards compatible with v0.4.
+
+- **Streaming wrappers** on all three provider clients:
+  - `CachedAnthropic.messages.stream(params)` returns a `CachedStream<MessageStreamEvent>`.
+  - `CachedOpenAI.chat.completions.create({ ..., stream: true })` returns a `CachedOpenAIChatStream`. The wrapper auto-enables `stream_options.include_usage: true` so cacheInfo can be computed from the final chunk's usage — without that flag, OpenAI returns no usage at all in streaming mode.
+  - `CachedGemini.models.generateContentStream(params)` returns a `CachedGeminiStream`.
+- Every wrapped stream is async-iterable for incremental chunk consumption AND exposes `await stream.final()` which resolves with `{ cacheInfo, raw }`. If the caller skips iteration, `final()` drains the stream itself.
+- Streaming responses participate in the same stats / stability / cache-miss-diagnostic pipeline as non-streaming responses.
+- **Auto-managed Gemini explicit caching** — opt-in via `autoCache: true` on `CachedGemini`. The wrapper observes the stability of `config.systemInstruction` across calls and, once it's been seen unchanged for `autoCacheMinObservations` (default 2) consecutive calls, creates a `CachedContent` for it and references it via `config.cachedContent` on subsequent matching calls (removing `systemInstruction` from the outgoing payload). New options: `autoCache`, `autoCacheMinObservations`, `autoCacheTtl` (default 300s).
+- New methods on `CachedGemini`: `client.gc()` evicts expired auto-managed caches; `client.managedCaches()` returns a snapshot of currently managed entries.
+- Auto-cache failure modes are deliberately silent: when Gemini rejects a `caches.create` because the instruction is too small (~32k token minimum depending on model), the wrapper falls back to passing `systemInstruction` through verbatim — the implicit cache still works.
+- New public exports: `CachedStream`, `CachedStreamFinal`, `CachedStreamHooks`, `CachedOpenAIChatStream`, `OpenAIChatCompletionChunk`, `CachedGeminiStream`, `GeminiAutoCacheManager`, `AutoCacheManagerOptions`, `AutoCacheApplyResult`.
+- Internal refactor: extracted `_prepareOutgoing` / `_processUsage` (Anthropic), `_processOpenAIUsage` (OpenAI), `_prepareGeminiOutgoing` / `_processGeminiUsage` (Gemini) so the streaming and non-streaming code paths share one set of well-tested helpers.
+- New examples: `examples/streaming-all-three.ts` and `examples/gemini-auto-cache.ts`.
+
 ## 0.4.0
 
 Headline feature — multi-provider support. Fully backwards compatible with v0.3.
@@ -81,5 +98,5 @@ Initial release.
 
 ## Unreleased / planned
 
-- v0.5: streaming wrappers for all three providers; auto-managed Gemini explicit caching (`CachedContent` lifecycle)
-- v1.0: persistent stats adapter (write hit-rate to disk / Redis), middleware mode for Express/Fastify
+- v0.6: auto-refresh of Gemini auto-managed CachedContent TTLs (avoid create-churn for long sessions); OpenAI Responses API wrapper
+- v1.0: persistent stats adapter (write hit-rate to disk / Redis so multi-process services can share state), middleware mode for Express/Fastify

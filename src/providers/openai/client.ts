@@ -20,12 +20,20 @@
  *   - `warnIfPromptTooSmall` (default true) flags calls below OpenAI's
  *     1024-token cache-minimum so you know why no caching is happening.
  *
- * Streaming is not yet wrapped (v0.4 ships non-streaming only). The raw
- * SDK is exposed at `.raw` for advanced use.
+ * v0.5 adds streaming: pass `stream: true` to `chat.completions.create`
+ * and you get back a CachedStream that yields ChatCompletionChunks AND
+ * exposes `.final()` resolving with cacheInfo. The wrapper auto-sets
+ * `stream_options.include_usage: true` (with a one-time info warning)
+ * so the final chunk carries the usage object — without that flag,
+ * OpenAI's API returns no usage at all in streaming mode and cacheInfo
+ * would be permanently zero.
+ *
+ * The raw SDK is exposed at `.raw` for advanced use.
  */
 
 import { snapshotRequest } from "../../analyzer/fingerprint.js";
 import { StabilityTracker } from "../../analyzer/stability-tracker.js";
+import { CachedStream } from "../../core/cached-stream.js";
 import { diffSnapshots } from "../../diagnostics/diff.js";
 import { safeEmit } from "../../diagnostics/warnings.js";
 import { StatsAggregator } from "../../tracking/stats.js";
@@ -59,6 +67,30 @@ export interface OpenAIChatCompletion {
   [k: string]: unknown;
 }
 
+/** Minimal structural shape of an OpenAI streaming chunk. */
+export interface OpenAIChatCompletionChunk {
+  id?: string;
+  choices?: Array<{
+    delta?: { content?: string | null; role?: string; [k: string]: unknown };
+    finish_reason?: string | null;
+    [k: string]: unknown;
+  }>;
+  /** Only present on the FINAL chunk when stream_options.include_usage is true. */
+  usage?: OpenAIUsage;
+  model?: string;
+  [k: string]: unknown;
+}
+
+/**
+ * The streaming-side return type of `chat.completions.create({ stream: true })`.
+ * Iterate it for chunks; await `.final()` for cacheInfo.
+ */
+export type CachedOpenAIChatStream = CachedStream<
+  OpenAIChatCompletionChunk,
+  { lastUsage: OpenAIUsage | undefined },
+  OpenAIChatCompletionChunk | undefined
+>;
+
 export type CachedChatCompletion = OpenAIChatCompletion & {
   cacheInfo: CacheInfo;
 };
@@ -71,7 +103,9 @@ export type CachedChatCompletion = OpenAIChatCompletion & {
 type OpenAIInstance = {
   chat: {
     completions: {
-      create: (params: Record<string, unknown>) => Promise<OpenAIChatCompletion>;
+      create: (
+        params: Record<string, unknown>,
+      ) => Promise<OpenAIChatCompletion | AsyncIterable<OpenAIChatCompletionChunk>>;
     };
   };
 };
@@ -128,6 +162,8 @@ export class CachedOpenAI {
   private readonly stats_: StatsAggregator;
   private readonly tracker: StabilityTracker;
   private readonly opts: CachedOpenAIOptions;
+  /** Suppress duplicate "we auto-enabled include_usage" warnings per session. */
+  private warnedAboutIncludeUsage = false;
 
   constructor(opts: CachedOpenAIOptions = {}) {
     this.opts = opts;
@@ -171,6 +207,76 @@ export class CachedOpenAI {
   resetStats(): void {
     this.stats_.reset();
     this.tracker.reset();
+    this.warnedAboutIncludeUsage = false;
+  }
+
+  /**
+   * Shared post-response pipeline: compute cacheInfo from a usage object,
+   * fire diagnostics, accumulate stats. Used by both non-streaming and
+   * streaming paths.
+   */
+  private _processOpenAIUsage(
+    model: string,
+    usage: OpenAIUsage,
+    previousSnapshot: ReturnType<StabilityTracker["previousSnapshot"]>,
+    currentSnapshot: ReturnType<typeof snapshotRequest>,
+  ): CacheInfo {
+    const pricing = lookupOpenAIPricing(model, this.opts.pricingOverride);
+    if (!pricing) {
+      safeEmit(this.opts.onWarning, {
+        code: "unknown-model",
+        message: `Pricing unknown for OpenAI model "${model}" — dollar accounting will report 0 for this call.`,
+        detail: { model },
+      });
+    }
+    const cacheInfo = computeOpenAICacheInfo(usage, pricing);
+
+    const priorStats = this.stats_.snapshot();
+    const hadPriorCacheActivity = priorStats.totalCachedTokens > 0;
+    if (
+      cacheInfo.cachedTokens === 0 &&
+      cacheInfo.uncachedTokens > 0 &&
+      hadPriorCacheActivity
+    ) {
+      const detail: Record<string, unknown> = {};
+      if (this.opts.diagnoseMisses && previousSnapshot) {
+        const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
+        if (diffs.length > 0) {
+          detail.diff = diffs;
+          detail.summary = diffs.map((d) => d.summary).join("; ");
+        }
+      }
+      safeEmit(this.opts.onWarning, {
+        code: "cache-write-without-read",
+        message:
+          "This call wrote to the prompt cache but read nothing — your prefix likely changed since the last call. Common causes: tools reordered, system message edited, or the cache TTL expired (OpenAI caches typically retain for 5–10 minutes)." +
+          (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
+        ...(Object.keys(detail).length > 0 ? { detail } : {}),
+      });
+    }
+
+    this.stats_.record(cacheInfo);
+
+    const threshold = this.opts.warnIfHitRateBelow ?? 0;
+    const window = this.opts.hitRateWindow ?? 20;
+    if (
+      threshold > 0 &&
+      this.stats_.rollingSampleCount() >= window &&
+      this.stats_.rollingHitRate() < threshold
+    ) {
+      safeEmit(this.opts.onWarning, {
+        code: "low-hit-rate",
+        message: `Rolling cache hit rate (${(
+          this.stats_.rollingHitRate() * 100
+        ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
+        detail: {
+          rollingHitRate: this.stats_.rollingHitRate(),
+          threshold,
+          window,
+        },
+      });
+    }
+    return cacheInfo;
   }
 
   /** Mirror of `openai.chat.completions` with a wrapped `create`. */
@@ -178,7 +284,7 @@ export class CachedOpenAI {
     completions: {
       create: async (
         params: Record<string, unknown>,
-      ): Promise<CachedChatCompletion> => {
+      ): Promise<CachedChatCompletion | CachedOpenAIChatStream> => {
         const userMessages = (params.messages ?? []) as Array<{
           role: "system" | "user" | "assistant" | "tool";
           content: unknown;
@@ -234,79 +340,88 @@ export class CachedOpenAI {
           }
         }
 
-        const outgoing: Record<string, unknown> = {
+        const isStreaming = params.stream === true;
+
+        // For streaming, OpenAI only returns usage in the final chunk
+        // when stream_options.include_usage is true. Auto-set it (and
+        // warn once) so cacheInfo isn't permanently zero.
+        let outgoing: Record<string, unknown> = {
           ...params,
           ...(outgoingTools !== undefined ? { tools: outgoingTools } : {}),
         };
+        if (isStreaming) {
+          const streamOpts =
+            (outgoing.stream_options as Record<string, unknown> | undefined) ?? {};
+          if (streamOpts.include_usage !== true) {
+            outgoing = {
+              ...outgoing,
+              stream_options: { ...streamOpts, include_usage: true },
+            };
+            if (!this.warnedAboutIncludeUsage) {
+              this.warnedAboutIncludeUsage = true;
+              safeEmit(this.opts.onWarning, {
+                code: "auto-reorder-applied",
+                message:
+                  "Auto-enabled stream_options.include_usage=true so cacheInfo can be computed from the final chunk's usage object.",
+                detail: { reason: "openai-include-usage-auto-on" },
+              });
+            }
+          }
+        }
 
         const raw = await this.getRaw();
-        const response = await raw.chat.completions.create(outgoing);
+        const model = (params.model as string) ?? "";
 
-        const model = (params.model as string) ?? response.model ?? "";
-        const pricing = lookupOpenAIPricing(model, this.opts.pricingOverride);
-        if (!pricing) {
-          safeEmit(this.opts.onWarning, {
-            code: "unknown-model",
-            message: `Pricing unknown for OpenAI model "${model}" — dollar accounting will report 0 for this call.`,
-            detail: { model },
-          });
+        if (isStreaming) {
+          // Streaming path — return a CachedStream the caller can iterate.
+          const rawStream = (await raw.chat.completions.create(
+            outgoing,
+          )) as AsyncIterable<OpenAIChatCompletionChunk>;
+          return new CachedStream<
+            OpenAIChatCompletionChunk,
+            { lastUsage: OpenAIUsage | undefined },
+            OpenAIChatCompletionChunk | undefined
+          >(rawStream, {
+            initialState: { lastUsage: undefined },
+            onChunk: (chunk, state) => {
+              // The final chunk carries usage (when include_usage:true).
+              // Intermediate chunks won't have it.
+              if (chunk.usage) {
+                return { lastUsage: chunk.usage };
+              }
+              return state;
+            },
+            finalize: async (state) => {
+              const usage = state.lastUsage ?? {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+              };
+              const cacheInfo = this._processOpenAIUsage(
+                model,
+                usage,
+                previousSnapshot,
+                currentSnapshot,
+              );
+              return { cacheInfo, raw: undefined };
+            },
+          }) as CachedOpenAIChatStream;
         }
+
+        // Non-streaming path — original behavior.
+        const response = (await raw.chat.completions.create(
+          outgoing,
+        )) as OpenAIChatCompletion;
 
         const usage = response.usage ?? {
           prompt_tokens: 0,
           completion_tokens: 0,
         };
-        const cacheInfo = computeOpenAICacheInfo(usage, pricing);
-
-        // Cache-miss diagnostic: if this call processed >0 prompt tokens
-        // un-cached AND we'd had cache activity on a prior call AND
-        // diagnoseMisses is on, compute a prefix diff.
-        const priorStats = this.stats_.snapshot();
-        const hadPriorCacheActivity = priorStats.totalCachedTokens > 0;
-        if (
-          cacheInfo.cachedTokens === 0 &&
-          cacheInfo.uncachedTokens > 0 &&
-          hadPriorCacheActivity
-        ) {
-          const detail: Record<string, unknown> = {};
-          if (this.opts.diagnoseMisses && previousSnapshot) {
-            const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
-            if (diffs.length > 0) {
-              detail.diff = diffs;
-              detail.summary = diffs.map((d) => d.summary).join("; ");
-            }
-          }
-          safeEmit(this.opts.onWarning, {
-            code: "cache-write-without-read",
-            message:
-              "This call wrote to the prompt cache but read nothing — your prefix likely changed since the last call. Common causes: tools reordered, system message edited, or the cache TTL expired (OpenAI caches typically retain for 5–10 minutes)." +
-              (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
-            ...(Object.keys(detail).length > 0 ? { detail } : {}),
-          });
-        }
-
-        this.stats_.record(cacheInfo);
-
-        // Rolling hit-rate alert
-        const threshold = this.opts.warnIfHitRateBelow ?? 0;
-        const window = this.opts.hitRateWindow ?? 20;
-        if (
-          threshold > 0 &&
-          this.stats_.rollingSampleCount() >= window &&
-          this.stats_.rollingHitRate() < threshold
-        ) {
-          safeEmit(this.opts.onWarning, {
-            code: "low-hit-rate",
-            message: `Rolling cache hit rate (${(
-              this.stats_.rollingHitRate() * 100
-            ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
-            detail: {
-              rollingHitRate: this.stats_.rollingHitRate(),
-              threshold,
-              window,
-            },
-          });
-        }
+        const cacheInfo = this._processOpenAIUsage(
+          model,
+          usage,
+          previousSnapshot,
+          currentSnapshot,
+        );
 
         Object.defineProperty(response, "cacheInfo", {
           value: cacheInfo,

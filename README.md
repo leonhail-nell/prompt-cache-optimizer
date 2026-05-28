@@ -12,7 +12,7 @@ Drop-in wrappers for the Anthropic, OpenAI, and Gemini SDKs that make prompt cac
 
 > Real output from `bun run example`. Six calls — autoCache marks the system prompt cacheable after observing it twice, calls 3–5 hit the cache (~1569 cached tokens each), and a final deliberate drift triggers the diagnostic showing the exact characters that changed. `client.stability()` reports `system score=0.80` cumulative across the run.
 
-> Status: v0.4 — adds drop-in wrappers for OpenAI and Gemini alongside Anthropic. One library, three providers, one consistent `cacheInfo`/`stats()`/`stability()` surface. Backwards compatible with v0.1–0.3.
+> Status: v0.5 — adds streaming wrappers on all three providers and auto-managed Gemini explicit caching (`CachedContent` lifecycle). Backwards compatible with v0.1–0.4.
 
 ## Why this exists
 
@@ -155,6 +155,90 @@ Regardless of provider, every wrapped client exposes the same surface:
 - `diagnoseMisses` — when the cache misses, attach a human-readable diff explaining what changed in the prefix.
 - Built-in pricing tables — override per-instance with `pricingOverride`.
 - Passive warning events via `onWarning` — never throws, never blocks a request.
+
+## Streaming (v0.5)
+
+Every provider client gained a streaming entry point in v0.5. The shape is consistent: an async-iterable you can consume chunk-by-chunk AND a `.final()` promise that resolves with `cacheInfo` after the stream ends.
+
+```ts
+// Anthropic
+const stream = client.messages.stream({
+  model: "claude-sonnet-4-6",
+  max_tokens: 1024,
+  system: [{ type: "text", text: longSystemPrompt, cache_control: { type: "ephemeral" } }],
+  messages: conversation,
+});
+for await (const event of stream) {
+  if (event.type === "content_block_delta") process.stdout.write(event.delta.text ?? "");
+}
+const { cacheInfo, raw } = await stream.final();
+console.log(`saved $${cacheInfo.dollarsSaved.toFixed(4)} on this stream`);
+
+// OpenAI — pass `stream: true` to the existing create method
+const stream = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [...],
+  stream: true,
+  // The wrapper auto-enables stream_options.include_usage:true so the
+  // final chunk's usage object is available for cacheInfo. Without it,
+  // OpenAI returns no usage at all in streaming mode.
+});
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices?.[0]?.delta?.content ?? "");
+}
+const { cacheInfo } = await stream.final();
+
+// Gemini — dedicated generateContentStream method
+const stream = await client.models.generateContentStream({
+  model: "gemini-2.5-flash",
+  contents: [{ role: "user", parts: [{ text: question }] }],
+  config: { systemInstruction: longSystemInstruction },
+});
+for await (const chunk of stream) {
+  process.stdout.write(chunk.text ?? "");
+}
+const { cacheInfo } = await stream.final();
+```
+
+If you don't want incremental chunks, you can skip the iteration entirely — `final()` will drain the stream itself. Streaming responses participate in the same `stats()` / `stability()` / `diagnoseMisses` pipeline as non-streaming responses.
+
+## Auto-managed Gemini explicit caching (v0.5)
+
+Gemini's `CachedContent` API gives you the deepest cache savings on long context (~75% off cached tokens) but it's the most cumbersome to use — you have to POST a cache resource, get back a name, reference it, then clean it up. v0.5 automates the whole lifecycle:
+
+```ts
+const client = new CachedGemini({
+  apiKey,
+  autoCache: true,                  // ← enable auto-managed CachedContent
+  autoCacheMinObservations: 2,      // create after 2 stable observations (default)
+  autoCacheTtl: 600,                // seconds (default 300)
+});
+
+// Just call it normally — the wrapper handles the cache lifecycle.
+for (const question of questions) {
+  const res = await client.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts: [{ text: question }] }],
+    config: { systemInstruction: longSystemInstruction },
+  });
+  console.log(res.cacheInfo);  // hit:true after the cache is created
+}
+
+console.log(client.managedCaches());
+// [{ fingerprint: '...', name: 'cachedContents/auto-1', expiresInSeconds: 587, approxTokens: 8420 }]
+
+await client.gc();  // optional — sweep expired entries
+```
+
+How it works:
+
+1. The wrapper observes `config.systemInstruction` across calls and tracks consecutive-stable counts per fingerprint.
+2. After `autoCacheMinObservations` calls (default 2) with the same instruction, it calls `caches.create({ contents: [systemInstruction] })` and stashes the resulting cache name keyed by fingerprint.
+3. On subsequent matching calls, it swaps `systemInstruction` out and `cachedContent: name` in. Gemini bills the cached portion at ~25% of standard input.
+4. When the instruction changes, the previously created cache is best-effort deleted.
+5. Failure modes are silent: if Gemini rejects the create (most commonly because the instruction is below the ~32k-token minimum for explicit caching), the wrapper falls back to passing the instruction verbatim — the implicit cache still works.
+
+Explicit user intent always wins. If you pass `config.cachedContent` yourself, the wrapper leaves it alone.
 
 ## How Anthropic auto-placement decides what to cache
 
@@ -310,7 +394,8 @@ new CachedAnthropic({
 - ~~**v0.2** — auto-placement of `cache_control` breakpoints based on observed prompt stability~~ ✅ shipped
 - ~~**v0.3** — safe message and tool reordering to maximize the stable prefix~~ ✅ shipped
 - ~~**v0.4** — OpenAI and Gemini prompt caching support~~ ✅ shipped
-- **v0.5** — streaming wrappers; auto-managed Gemini `CachedContent` lifecycle
+- ~~**v0.5** — streaming wrappers; auto-managed Gemini `CachedContent` lifecycle~~ ✅ shipped
+- **v0.6** — auto-refresh of Gemini CachedContent TTLs for long sessions; OpenAI Responses API wrapper
 - **v1.0** — persistent stats adapter, middleware mode
 
 ## Zero runtime dependencies

@@ -23,6 +23,16 @@
  *   - CachedGemini (wraps `@google/genai`)
  *   - OpenAI + Gemini pricing tables, usage extractors, option types
  *   - 'prompt-too-small-for-cache' and 'gemini-cache-applied' warning codes
+ *
+ * Added in v0.5:
+ *   - CachedStream (shared streaming wrapper class)
+ *   - messages.stream() on CachedAnthropic
+ *   - stream:true support on CachedOpenAI.chat.completions.create
+ *   - models.generateContentStream() on CachedGemini
+ *   - autoCache + autoCacheMinObservations + autoCacheTtl on CachedGemini
+ *     for auto-managed explicit CachedContent lifecycle
+ *   - client.gc() and client.managedCaches() on CachedGemini
+ *   - GeminiAutoCacheManager exported for advanced use
  */
 
 export { CachedAnthropic } from "./client.js";
@@ -72,6 +82,16 @@ export { StatsAggregator } from "./tracking/stats.js";
 export { lookupPricing, KNOWN_MODELS } from "./pricing/models.js";
 
 /* -------------------------------------------------------------------------- */
+/* v0.5: shared streaming                                                      */
+/* -------------------------------------------------------------------------- */
+
+export { CachedStream } from "./core/cached-stream.js";
+export type {
+  CachedStreamFinal,
+  CachedStreamHooks,
+} from "./core/cached-stream.js";
+
+/* -------------------------------------------------------------------------- */
 /* v0.4: OpenAI                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -79,6 +99,8 @@ export { CachedOpenAI } from "./providers/openai/client.js";
 export type {
   CachedChatCompletion,
   OpenAIChatCompletion,
+  OpenAIChatCompletionChunk,
+  CachedOpenAIChatStream,
 } from "./providers/openai/client.js";
 export {
   lookupOpenAIPricing,
@@ -98,9 +120,15 @@ export { OPENAI_CACHE_MIN_TOKENS } from "./providers/openai/types.js";
 export { CachedGemini } from "./providers/gemini/client.js";
 export type {
   CachedGeminiResponse,
+  CachedGeminiStream,
   GeminiResponse,
   GeminiCachedContent,
 } from "./providers/gemini/client.js";
+export { GeminiAutoCacheManager } from "./providers/gemini/auto-cache-manager.js";
+export type {
+  AutoCacheManagerOptions,
+  AutoCacheApplyResult,
+} from "./providers/gemini/auto-cache-manager.js";
 export {
   lookupGeminiPricing,
   KNOWN_GEMINI_MODELS,

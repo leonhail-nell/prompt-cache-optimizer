@@ -3,6 +3,7 @@ dist/
 dist-v2/
 dist-v3/
 dist-v4/
+dist-v5/
 coverage/
 .env
 .env.local

@@ -27,6 +27,7 @@
 
 import { snapshotRequest } from "../../analyzer/fingerprint.js";
 import { StabilityTracker } from "../../analyzer/stability-tracker.js";
+import { CachedStream } from "../../core/cached-stream.js";
 import { diffSnapshots } from "../../diagnostics/diff.js";
 import { safeEmit } from "../../diagnostics/warnings.js";
 import { StatsAggregator } from "../../tracking/stats.js";
@@ -36,6 +37,7 @@ import type {
   StabilityReport,
 } from "../../types.js";
 
+import { GeminiAutoCacheManager } from "./auto-cache-manager.js";
 import { lookupGeminiPricing } from "./pricing.js";
 import type { CachedGeminiOptions } from "./types.js";
 import {
@@ -47,6 +49,9 @@ import {
 interface GeminiSDK {
   models: {
     generateContent: (params: Record<string, unknown>) => Promise<GeminiResponse>;
+    generateContentStream: (
+      params: Record<string, unknown>,
+    ) => Promise<AsyncIterable<GeminiResponse>>;
   };
   caches: {
     create: (params: Record<string, unknown>) => Promise<GeminiCachedContent>;
@@ -75,6 +80,16 @@ export interface GeminiCachedContent {
 }
 
 export type CachedGeminiResponse = GeminiResponse & { cacheInfo: CacheInfo };
+
+/**
+ * The streaming-side return type of `models.generateContentStream(...)`.
+ * Iterate it for partial responses; await `.final()` for cacheInfo.
+ */
+export type CachedGeminiStream = CachedStream<
+  GeminiResponse,
+  { lastUsage: GeminiUsageMetadata | undefined },
+  GeminiResponse | undefined
+>;
 
 type GeminiCtor = new (opts: Record<string, unknown>) => GeminiSDK;
 
@@ -124,11 +139,20 @@ export class CachedGemini {
   private readonly stats_: StatsAggregator;
   private readonly tracker: StabilityTracker;
   private readonly opts: CachedGeminiOptions;
+  /** v0.5: auto-managed explicit CachedContent. Null when autoCache:false. */
+  private readonly autoCache: GeminiAutoCacheManager | null;
 
   constructor(opts: CachedGeminiOptions = {}) {
     this.opts = opts;
     this.stats_ = new StatsAggregator(opts.hitRateWindow ?? 20);
     this.tracker = new StabilityTracker();
+    this.autoCache = opts.autoCache
+      ? new GeminiAutoCacheManager({
+          minObservations: opts.autoCacheMinObservations ?? 2,
+          ttlSeconds: opts.autoCacheTtl ?? 300,
+          onWarning: opts.onWarning,
+        })
+      : null;
   }
 
   /** Resolve the underlying SDK client, instantiating it on first call. */
@@ -162,131 +186,214 @@ export class CachedGemini {
   resetStats(): void {
     this.stats_.reset();
     this.tracker.reset();
+    // Best-effort: also clear any auto-managed caches on the server.
+    if (this.autoCache) {
+      void this.getRaw().then((raw) => this.autoCache!.clear(raw.caches));
+    }
   }
 
   /**
-   * Mirror of `googleGenAI.models` with a wrapped `generateContent`.
-   * Other methods on `.models` (`generateContentStream`, `embedContent`,
-   * etc.) are not wrapped in v0.4 — use `.raw.models.*` for those.
+   * v0.5: sweep expired auto-managed CachedContents. Returns the
+   * number of entries evicted. Safe to call any time; a no-op when
+   * autoCache is disabled.
    */
+  async gc(): Promise<number> {
+    if (!this.autoCache) return 0;
+    const raw = await this.getRaw();
+    return this.autoCache.gc(raw.caches);
+  }
+
+  /**
+   * v0.5: snapshot of currently-managed auto caches (debug helper).
+   * Empty when autoCache is disabled.
+   */
+  managedCaches(): Array<{
+    fingerprint: string;
+    name: string;
+    expiresInSeconds: number;
+    approxTokens: number;
+  }> {
+    return this.autoCache?.list() ?? [];
+  }
+
+  /**
+   * Shared post-response pipeline. Used by both generateContent (non-
+   * streaming) and generateContentStream (streaming, after the final
+   * chunk is consumed).
+   */
+  private _processGeminiUsage(
+    model: string,
+    usage: GeminiUsageMetadata | undefined,
+    previousSnapshot: ReturnType<StabilityTracker["previousSnapshot"]>,
+    currentSnapshot: ReturnType<typeof snapshotRequest>,
+  ): CacheInfo {
+    const pricing = lookupGeminiPricing(model, this.opts.pricingOverride);
+    if (!pricing) {
+      safeEmit(this.opts.onWarning, {
+        code: "unknown-model",
+        message: `Pricing unknown for Gemini model "${model}" — dollar accounting will report 0 for this call.`,
+        detail: { model },
+      });
+    }
+    const cacheInfo = computeGeminiCacheInfo(usage, pricing);
+
+    const priorStats = this.stats_.snapshot();
+    const hadPriorCacheActivity = priorStats.totalCachedTokens > 0;
+    if (
+      cacheInfo.cachedTokens === 0 &&
+      cacheInfo.uncachedTokens > 0 &&
+      hadPriorCacheActivity
+    ) {
+      const detail: Record<string, unknown> = {};
+      if (this.opts.diagnoseMisses && previousSnapshot) {
+        const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
+        if (diffs.length > 0) {
+          detail.diff = diffs;
+          detail.summary = diffs.map((d) => d.summary).join("; ");
+        }
+      }
+      safeEmit(this.opts.onWarning, {
+        code: "cache-write-without-read",
+        message:
+          "This Gemini call did not benefit from any cached content even though a prior call did. Your prefix likely changed, an explicit CachedContent expired, or your prompt fell below the implicit-caching minimum." +
+          (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
+        ...(Object.keys(detail).length > 0 ? { detail } : {}),
+      });
+    }
+
+    this.stats_.record(cacheInfo);
+
+    const threshold = this.opts.warnIfHitRateBelow ?? 0;
+    const window = this.opts.hitRateWindow ?? 20;
+    if (
+      threshold > 0 &&
+      this.stats_.rollingSampleCount() >= window &&
+      this.stats_.rollingHitRate() < threshold
+    ) {
+      safeEmit(this.opts.onWarning, {
+        code: "low-hit-rate",
+        message: `Rolling cache hit rate (${(
+          this.stats_.rollingHitRate() * 100
+        ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
+        detail: {
+          rollingHitRate: this.stats_.rollingHitRate(),
+          threshold,
+          window,
+        },
+      });
+    }
+    return cacheInfo;
+  }
+
+  /**
+   * Shared pre-send pipeline. Returns the modified outgoing params and
+   * the snapshots needed by the post-response pipeline. Used by both
+   * non-streaming and streaming code paths.
+   */
+  private _prepareGeminiOutgoing(params: Record<string, unknown>): {
+    outgoing: Record<string, unknown>;
+    previousSnapshot: ReturnType<StabilityTracker["previousSnapshot"]>;
+    currentSnapshot: ReturnType<typeof snapshotRequest>;
+  } {
+    const userContents = (params.contents ?? []) as Array<{
+      role?: string;
+      parts?: unknown[];
+      [k: string]: unknown;
+    }>;
+    const config = (params.config ?? {}) as {
+      tools?: GeminiToolParam[];
+      cachedContent?: string;
+      [k: string]: unknown;
+    };
+    const userTools = config.tools;
+
+    let outgoingTools = userTools;
+    if (this.opts.autoReorder && userTools && userTools.length > 0) {
+      const result = canonicalizeGeminiTools(userTools);
+      if (result.changed) {
+        outgoingTools = result.tools;
+        safeEmit(this.opts.onWarning, {
+          code: "auto-reorder-applied",
+          message: `Auto-reorder alphabetized Gemini functionDeclarations (${result.moved} moved).`,
+          detail: { moved: result.moved },
+        });
+      }
+    }
+
+    const previousSnapshot = this.tracker.previousSnapshot();
+    const currentSnapshot = snapshotRequestForGemini(
+      userContents,
+      outgoingTools,
+    );
+    this.tracker.observe(currentSnapshot);
+
+    if (config.cachedContent) {
+      safeEmit(this.opts.onWarning, {
+        code: "gemini-cache-applied",
+        message: `Using explicit CachedContent: ${config.cachedContent}`,
+        detail: { cachedContent: config.cachedContent },
+      });
+    }
+
+    const outgoing: Record<string, unknown> = {
+      ...params,
+      config: {
+        ...config,
+        ...(outgoingTools !== undefined ? { tools: outgoingTools } : {}),
+      },
+    };
+    return { outgoing, previousSnapshot, currentSnapshot };
+  }
+
+  /**
+   * Mirror of `googleGenAI.models` with wrapped `generateContent` (non-
+   * streaming) and `generateContentStream` (v0.5).
+   */
+  /**
+   * Apply auto-managed CachedContent to an outgoing payload if eligible.
+   * No-op when autoCache is disabled, no systemInstruction is present,
+   * or the user already set config.cachedContent.
+   */
+  private async _maybeApplyAutoCache(
+    outgoing: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.autoCache) return outgoing;
+    const config = (outgoing.config ?? {}) as Record<string, unknown>;
+    const systemInstruction = config.systemInstruction;
+    if (typeof systemInstruction !== "string" || !systemInstruction) {
+      return outgoing;
+    }
+    const { fingerprint: fp, count } = this.autoCache.observe(systemInstruction);
+    const raw = await this.getRaw();
+    const result = await this.autoCache.maybeApply(
+      fp,
+      count,
+      systemInstruction,
+      (outgoing.model as string) ?? "",
+      config,
+      raw.caches,
+    );
+    if (!result.applied) return outgoing;
+    return { ...outgoing, config: result.config };
+  }
+
   public readonly models = {
     generateContent: async (
       params: Record<string, unknown>,
     ): Promise<CachedGeminiResponse> => {
-      const userContents = (params.contents ?? []) as Array<{
-        role?: string;
-        parts?: unknown[];
-        [k: string]: unknown;
-      }>;
-      const config = (params.config ?? {}) as {
-        tools?: GeminiToolParam[];
-        cachedContent?: string;
-        [k: string]: unknown;
-      };
-      const userTools = config.tools;
-
-      // STEP 1 — auto-reorder. For Gemini we sort each tool entry's
-      // functionDeclarations[] by name.
-      let outgoingTools = userTools;
-      if (this.opts.autoReorder && userTools && userTools.length > 0) {
-        const result = canonicalizeGeminiTools(userTools);
-        if (result.changed) {
-          outgoingTools = result.tools;
-          safeEmit(this.opts.onWarning, {
-            code: "auto-reorder-applied",
-            message: `Auto-reorder alphabetized Gemini functionDeclarations (${result.moved} moved).`,
-            detail: { moved: result.moved },
-          });
-        }
-      }
-
-      // STEP 2 — snapshot for stability tracking.
-      const previousSnapshot = this.tracker.previousSnapshot();
-      const currentSnapshot = snapshotRequestForGemini(
-        userContents,
-        outgoingTools,
-      );
-      this.tracker.observe(currentSnapshot);
-
-      // STEP 3 — if an explicit cachedContent was passed, note it.
-      if (config.cachedContent) {
-        safeEmit(this.opts.onWarning, {
-          code: "gemini-cache-applied",
-          message: `Using explicit CachedContent: ${config.cachedContent}`,
-          detail: { cachedContent: config.cachedContent },
-        });
-      }
-
-      const outgoing: Record<string, unknown> = {
-        ...params,
-        config: {
-          ...config,
-          ...(outgoingTools !== undefined ? { tools: outgoingTools } : {}),
-        },
-      };
-
+      const prepared = this._prepareGeminiOutgoing(params);
+      const outgoing = await this._maybeApplyAutoCache(prepared.outgoing);
+      const previousSnapshot = prepared.previousSnapshot;
+      const currentSnapshot = prepared.currentSnapshot;
       const raw = await this.getRaw();
       const response = await raw.models.generateContent(outgoing);
-
       const model = (params.model as string) ?? "";
-      const pricing = lookupGeminiPricing(model, this.opts.pricingOverride);
-      if (!pricing) {
-        safeEmit(this.opts.onWarning, {
-          code: "unknown-model",
-          message: `Pricing unknown for Gemini model "${model}" — dollar accounting will report 0 for this call.`,
-          detail: { model },
-        });
-      }
-
-      const cacheInfo = computeGeminiCacheInfo(response.usageMetadata, pricing);
-
-      // Cache-miss diagnostic for non-first calls
-      const priorStats = this.stats_.snapshot();
-      const hadPriorCacheActivity = priorStats.totalCachedTokens > 0;
-      if (
-        cacheInfo.cachedTokens === 0 &&
-        cacheInfo.uncachedTokens > 0 &&
-        hadPriorCacheActivity
-      ) {
-        const detail: Record<string, unknown> = {};
-        if (this.opts.diagnoseMisses && previousSnapshot) {
-          const diffs = diffSnapshots(previousSnapshot, currentSnapshot);
-          if (diffs.length > 0) {
-            detail.diff = diffs;
-            detail.summary = diffs.map((d) => d.summary).join("; ");
-          }
-        }
-        safeEmit(this.opts.onWarning, {
-          code: "cache-write-without-read",
-          message:
-            "This Gemini call did not benefit from any cached content even though a prior call did. Your prefix likely changed, an explicit CachedContent expired, or your prompt fell below the implicit-caching minimum." +
-            (detail.summary ? ` Detected: ${detail.summary as string}` : ""),
-          ...(Object.keys(detail).length > 0 ? { detail } : {}),
-        });
-      }
-
-      this.stats_.record(cacheInfo);
-
-      const threshold = this.opts.warnIfHitRateBelow ?? 0;
-      const window = this.opts.hitRateWindow ?? 20;
-      if (
-        threshold > 0 &&
-        this.stats_.rollingSampleCount() >= window &&
-        this.stats_.rollingHitRate() < threshold
-      ) {
-        safeEmit(this.opts.onWarning, {
-          code: "low-hit-rate",
-          message: `Rolling cache hit rate (${(
-            this.stats_.rollingHitRate() * 100
-          ).toFixed(1)}%) over the last ${window} calls is below your threshold of ${(threshold * 100).toFixed(1)}%.`,
-          detail: {
-            rollingHitRate: this.stats_.rollingHitRate(),
-            threshold,
-            window,
-          },
-        });
-      }
-
+      const cacheInfo = this._processGeminiUsage(
+        model,
+        response.usageMetadata,
+        previousSnapshot,
+        currentSnapshot,
+      );
       Object.defineProperty(response, "cacheInfo", {
         value: cacheInfo,
         enumerable: true,
@@ -294,6 +401,45 @@ export class CachedGemini {
         configurable: false,
       });
       return response as CachedGeminiResponse;
+    },
+    /**
+     * v0.5: streaming wrapper around `models.generateContentStream`.
+     * Returns a CachedStream that yields partial `GeminiResponse` chunks
+     * and exposes `.final()` resolving with `{ cacheInfo }`. Usage
+     * metadata is taken from the last chunk that carries it.
+     */
+    generateContentStream: async (
+      params: Record<string, unknown>,
+    ): Promise<CachedGeminiStream> => {
+      const prepared = this._prepareGeminiOutgoing(params);
+      const outgoing = await this._maybeApplyAutoCache(prepared.outgoing);
+      const previousSnapshot = prepared.previousSnapshot;
+      const currentSnapshot = prepared.currentSnapshot;
+      const raw = await this.getRaw();
+      const rawStream = await raw.models.generateContentStream(outgoing);
+      const model = (params.model as string) ?? "";
+      return new CachedStream<
+        GeminiResponse,
+        { lastUsage: GeminiUsageMetadata | undefined },
+        GeminiResponse | undefined
+      >(rawStream, {
+        initialState: { lastUsage: undefined },
+        onChunk: (chunk, state) => {
+          if (chunk.usageMetadata) {
+            return { lastUsage: chunk.usageMetadata };
+          }
+          return state;
+        },
+        finalize: async (state) => {
+          const cacheInfo = this._processGeminiUsage(
+            model,
+            state.lastUsage,
+            previousSnapshot,
+            currentSnapshot,
+          );
+          return { cacheInfo, raw: undefined };
+        },
+      });
     },
   };
 
